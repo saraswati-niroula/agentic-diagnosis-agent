@@ -38,7 +38,7 @@ GITHUB_API = "https://api.github.com"
 WORKFLOW_FILENAME = "test.yml"
 
 
-def trigger_run(owner, repo, failure_type, token, flaky_rate=0.5):
+def trigger_run(owner, repo, failure_type, token, flaky_rate=0.5, ambiguous_rate=0.8):
     url = f"{GITHUB_API}/repos/{owner}/{repo}/actions/workflows/{WORKFLOW_FILENAME}/dispatches"
     headers = {
         "Authorization": f"Bearer {token}",
@@ -46,12 +46,16 @@ def trigger_run(owner, repo, failure_type, token, flaky_rate=0.5):
     }
     payload = {
         "ref": "master",
-        "inputs": {"failure_type": failure_type, "flaky_rate": str(flaky_rate)},
+        "inputs": {
+            "failure_type": failure_type,
+            "flaky_rate": str(flaky_rate),
+            "ambiguous_rate": str(ambiguous_rate),
+        },
     }
     resp = requests.post(url, headers=headers, json=payload)
     if resp.status_code != 204:
         raise RuntimeError(f"Failed to trigger workflow: {resp.status_code} {resp.text}")
-    print(f"Triggered workflow_dispatch with failure_type={failure_type} flaky_rate={flaky_rate}")
+    print(f"Triggered workflow_dispatch with failure_type={failure_type} flaky_rate={flaky_rate} ambiguous_rate={ambiguous_rate}")
 
 
 def get_latest_run(owner, repo, token):
@@ -205,13 +209,19 @@ def main():
     parser.add_argument(
         "--failure-type",
         required=True,
-        choices=["none", "flaky_test", "real_regression", "env_dependency", "schema_change", "ci_infra_issue"],
+        choices=["none", "flaky_test", "real_regression", "env_dependency", "schema_change", "ci_infra_issue", "ambiguous_flaky_or_regression", "regression_with_redherring"],
     )
     parser.add_argument(
         "--flaky-rate",
         type=float,
         default=float(os.environ.get("FLAKY_RATE", "0.5")),
         help="Probability (0.0–1.0) that the flaky test fails (default: FLAKY_RATE env var or 0.5)",
+    )
+    parser.add_argument(
+        "--ambiguous-rate",
+        type=float,
+        default=float(os.environ.get("AMBIGUOUS_RATE", "0.8")),
+        help="Failure probability for ambiguous_flaky_or_regression (default: AMBIGUOUS_RATE env var or 0.8)",
     )
     args = parser.parse_args()
 
@@ -220,7 +230,7 @@ def main():
         print("ERROR: set GITHUB_TOKEN environment variable first.", file=sys.stderr)
         sys.exit(1)
 
-    trigger_run(args.owner, args.repo, args.failure_type, token, flaky_rate=args.flaky_rate)
+    trigger_run(args.owner, args.repo, args.failure_type, token, flaky_rate=args.flaky_rate, ambiguous_rate=args.ambiguous_rate)
 
     print("Waiting a few seconds for the run to register...")
     time.sleep(6)

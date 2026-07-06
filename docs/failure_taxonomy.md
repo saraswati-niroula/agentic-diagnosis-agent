@@ -1,6 +1,6 @@
 # Failure Taxonomy
 
-Six injection modes are supported. This document records:
+Eight injection modes are supported (Types 0–7). This document records:
 - what evidence each type produces in the structured JSON returned by `trigger_and_fetch.py`
 - what makes each type ambiguous relative to others
 - the overlap cases where the agent loop is genuinely necessary (not collapsible into a lookup table)
@@ -122,17 +122,65 @@ Failure rate is configurable via the `FLAKY_RATE` env var (passed as a workflow 
 
 ---
 
+## Type 6 — Ambiguous: high-rate flakiness mimicking regression
+
+**Injection:** `FAILURE_INJECTION=ambiguous_flaky_or_regression` → `assert random.random() >= AMBIGUOUS_RATE` (`AMBIGUOUS_RATE` env var, default `0.8`; kept separate from `FLAKY_RATE` so eval sweeps cannot silently inherit the wrong rate)
+
+**Ground truth:** `"ambiguous"` — the correct agent output is a ranked hypothesis list where no single hypothesis exceeds ~0.6 confidence, and `conclusion: "ambiguous"`.
+
+**Evidence fingerprint**
+
+| Field | Value |
+|---|---|
+| `had_failures` | `true` ~80% of runs, `false` ~20% |
+| `failures_detail[].test_id` | `tests/test_calculator.py::test_injection_target` |
+| `failures_detail[].message` | `AssertionError: Flaky failure injected (non-deterministic)` |
+| `summary_line` | `"1 failed, 7 passed in …"` or `"8 passed in …"` |
+| `log_file` | `"test/6_Run test suite.txt"` |
+| `no_test_output` | absent |
+
+**Distinguishing feature (with rerun history):** failure rate is ~80%, not 100% — eventually visible across 10+ reruns. Without rerun history, a single run is indistinguishable from `real_regression`. The error message is identical to `flaky_test`. This is deliberately the hardest ambiguity case: no single tool call resolves it on one run.
+
+**Evaluation note:** for this scenario, suppress rerun history from the agent's tool responses (trigger exactly once and do not expose prior run results). The correct label is `"ambiguous"`, not `real_regression` or `flaky_test`.
+
+---
+
+## Type 7 — Real regression with causally-inert red herring
+
+**Injection:** `FAILURE_INJECTION=regression_with_redherring`, `SIMULATED_DEPENDENCY` absent (same env condition as `env_dependency`)
+
+**Ground truth:** `real_regression` — the dependency absence is visible but causally inert.
+
+**Evidence fingerprint**
+
+| Field | Value |
+|---|---|
+| `had_failures` | `true` on every run |
+| `failures_detail[].test_id` | `tests/test_calculator.py::test_injection_target` |
+| `failures_detail[].message` | `AssertionError: Real regression injected (deterministic)` |
+| `summary_line` | `"1 failed, 7 passed in …"` every run |
+| `log_file` | `"test/6_Run test suite.txt"` |
+| `no_test_output` | absent |
+
+**Red herring:** `SIMULATED_DEPENDENCY` is absent in the runner environment (identical to `env_dependency`'s env state). An agent that queries environment variables or CI config may incorrectly attribute the failure to a dependency/environment change. The test fails from the code mutation; the missing `SIMULATED_DEPENDENCY` never reaches the failing assertion path — the `env_dependency` branch in `test_injection_target` is never entered.
+
+**Distinguishing feature:** failure message is `"Real regression injected (deterministic)"` (not `"Environment/dependency failure injected"`). A correctly implemented agent should identify the code mutation via `query_git_diff` and recognise the dependency absence as a coincident but causally unrelated change. An agent that over-weights environment signals without checking the assertion message will mis-classify this as `env_dependency`.
+
+---
+
 ## Overlap map — where the loop is genuinely necessary
 
 The cells below describe evidence states that are indistinguishable without additional tool calls.
 
-| | Flaky | Real regression | Dependency | CI infra | Schema change |
-|---|---|---|---|---|---|
-| **Flaky** | — | Single run: identical `AssertionError` on same test. Need rerun history to discriminate. | Single failed run: both show `AssertionError` on `test_injection_target`. Need env-change history + rerun history. | `no_test_output` separates infra immediately. | `TypeError` vs `AssertionError` separates immediately. |
-| **Real regression** | — | — | Both fail every run, same test. Need git diff (code change vs env change) + env-change query. | `no_test_output` separates immediately. | `TypeError` vs `AssertionError` separates immediately. |
-| **Dependency** | — | — | — | Both are environment-level failures with no code change. Discriminator: `no_test_output` (infra) vs pytest running (dep). | `TypeError` vs `AssertionError` separates immediately. |
-| **CI infra** | — | — | — | — | `no_test_output` separates immediately. |
-| **Schema change** | — | — | — | — | — |
+| | Flaky | Real regression | Dependency | CI infra | Schema change | Ambiguous (T6) | Regression+RH (T7) |
+|---|---|---|---|---|---|---|---|
+| **Flaky** | — | Single run: identical `AssertionError` on same test. Need rerun history to discriminate. | Single failed run: both show `AssertionError` on `test_injection_target`. Need env-change history + rerun history. | `no_test_output` separates infra immediately. | `TypeError` vs `AssertionError` separates immediately. | Indistinguishable on a single run; both are non-deterministic `AssertionError`. Need large rerun sample. | Message differs (`Real regression` vs `Flaky`); T7 fails every run. |
+| **Real regression** | — | — | Both fail every run, same test. Need git diff (code change vs env change) + env-change query. | `no_test_output` separates immediately. | `TypeError` vs `AssertionError` separates immediately. | Message differs; T6 passes ~20% of runs. | Both fail every run with same message. T7 also has absent `SIMULATED_DEPENDENCY` — need to check whether failure message is the dep assertion or the regression assertion. |
+| **Dependency** | — | — | — | Both are environment-level failures with no code change. Discriminator: `no_test_output` (infra) vs pytest running (dep). | `TypeError` vs `AssertionError` separates immediately. | T6 message is `Flaky failure`, not `Environment/dependency`. | T7 message is `Real regression`, not `Environment/dependency`; but env state looks identical. Agent must check assertion message before concluding env cause. |
+| **CI infra** | — | — | — | — | `no_test_output` separates immediately. | `no_test_output` separates immediately. | `no_test_output` separates immediately. |
+| **Schema change** | — | — | — | — | — | `TypeError` vs `AssertionError` separates immediately. | `TypeError` vs `AssertionError` separates immediately. |
+| **Ambiguous (T6)** | — | — | — | — | — | — | T6 passes ~20% of runs; T7 never passes. Message differs. |
+| **Regression+RH (T7)** | — | — | — | — | — | — | — |
 
 **The hard overlaps (require multiple tool calls and backtracking):**
 
@@ -141,6 +189,10 @@ The cells below describe evidence states that are indistinguishable without addi
 2. **Flaky vs. Dependency (single-run view)** — both can appear intermittent. Dependency failures correlate with runner/config changes; flakiness does not. Agent must call `query_ci_infra_status` and compare failure timestamps against known environment changes.
 
 3. **Real regression vs. Dependency** — both fail deterministically. Discriminator is the source of change: `query_git_diff` shows a code change for regression; `query_dependency_lockfile_diff` or `query_ci_infra_status` shows an environment change for dependency. In the ambiguous case, both happened at the same time — the agent must reason about which change is causally responsible.
+
+4. **Ambiguous (T6) vs. Flaky / Real regression (single run)** — on one run, T6 is indistinguishable from both. The failure message is identical to `flaky_test`; the failure rate cannot be estimated from one data point. This overlap is intentionally unresolvable without rerun history — the correct response is `conclusion: "ambiguous"`, not a forced classification.
+
+5. **Regression+RH (T7) vs. Dependency** — both show `SIMULATED_DEPENDENCY` absent and a deterministic failure. The discriminator is the `failures_detail[].message` field: T7 produces `"Real regression injected (deterministic)"`, not `"Environment/dependency failure injected"`. An agent that routes on env state before reading the assertion message will mis-classify. Resolution requires the agent to read the failure message before issuing a conclusion.
 
 **Caveat on "separates immediately" cells:** the diagonal claims above assume the tool layer is working correctly. A distinction that is logically immediate (e.g., `no_test_output: true` rules out a test failure) is only actually immediate if the extractor surfaces that field. This project encountered this failure mode directly: an early version of the log parser silently returned empty evidence rather than populating `no_test_output`, making a CI infra failure look identical to a flaky test with no output. The "immediate" separations in this table are therefore conditional on a correctly functioning tool layer — tool reliability is itself a load-bearing assumption in the diagnosis pipeline, and a legitimate point of fragility to acknowledge in any evaluation write-up.
 
@@ -152,9 +204,8 @@ These are scenarios where the correct label is **"ambiguous / insufficient evide
 
 | Scenario | Why it is ambiguous | Infrastructure needed |
 |---|---|---|
-| Intermittent failure with no rerun history | Cannot distinguish flaky from a real intermittent regression without reruns | None — trigger `flaky_test` exactly once and suppress rerun history from the agent's tool responses. Already producible. |
-| Failure on a run where both a code change and a dependency update landed simultaneously | Cannot determine whether the code change or the env change caused the failure without a bisect | New injection mode required: current `FAILURE_INJECTION` values are mutually exclusive single modes. Need a combined mode (e.g., `FAILURE_INJECTION=regression_plus_env`) that applies both a code mutation and unsets `SIMULATED_DEPENDENCY` in the same workflow run. |
-| A test that sometimes passes, sometimes fails, with a failure rate of ~80% | High enough to suggest regression, low enough that flakiness cannot be ruled out | **Implemented.** Pass `--flaky-rate 0.8` to `trigger_and_fetch.py` (or set `FLAKY_RATE=0.8`). The workflow input forwards it to the runner; `test_calculator.py` reads it via `FLAKY_RATE` env var and asserts `random.random() >= FLAKY_RATE`. |
+| **Type 6** — high-rate flakiness (~80%) with no rerun history | Cannot distinguish from a real regression on a single run; rate is high enough that even a small sample looks deterministic | **Implemented** (`ambiguous_flaky_or_regression`). Trigger once and suppress rerun history from agent tool responses. Rate controlled by `AMBIGUOUS_RATE` env var (default `0.8`), kept separate from `FLAKY_RATE` to prevent silent drift during batch eval runs. Ground truth: `"ambiguous"`. |
+| **Type 7** — real regression with causally-inert dependency red herring | `SIMULATED_DEPENDENCY` absent creates a plausible env-change hypothesis, but the failing assertion is the regression mutation, not the dependency check | **Implemented** (`regression_with_redherring`). Ground truth: `real_regression`. |
 
 In these cases the correct agent output is a ranked hypothesis list where no single hypothesis exceeds a confidence threshold (e.g., 0.6), and the `conclusion` field is `"ambiguous"` rather than a named failure type.
 
