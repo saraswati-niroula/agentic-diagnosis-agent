@@ -38,7 +38,7 @@ GITHUB_API = "https://api.github.com"
 WORKFLOW_FILENAME = "test.yml"
 
 
-def trigger_run(owner, repo, failure_type, token):
+def trigger_run(owner, repo, failure_type, token, flaky_rate=0.5):
     url = f"{GITHUB_API}/repos/{owner}/{repo}/actions/workflows/{WORKFLOW_FILENAME}/dispatches"
     headers = {
         "Authorization": f"Bearer {token}",
@@ -46,12 +46,12 @@ def trigger_run(owner, repo, failure_type, token):
     }
     payload = {
         "ref": "master",
-        "inputs": {"failure_type": failure_type},
+        "inputs": {"failure_type": failure_type, "flaky_rate": str(flaky_rate)},
     }
     resp = requests.post(url, headers=headers, json=payload)
     if resp.status_code != 204:
         raise RuntimeError(f"Failed to trigger workflow: {resp.status_code} {resp.text}")
-    print(f"Triggered workflow_dispatch with failure_type={failure_type}")
+    print(f"Triggered workflow_dispatch with failure_type={failure_type} flaky_rate={flaky_rate}")
 
 
 def get_latest_run(owner, repo, token):
@@ -207,6 +207,12 @@ def main():
         required=True,
         choices=["none", "flaky_test", "real_regression", "env_dependency", "schema_change", "ci_infra_issue"],
     )
+    parser.add_argument(
+        "--flaky-rate",
+        type=float,
+        default=float(os.environ.get("FLAKY_RATE", "0.5")),
+        help="Probability (0.0–1.0) that the flaky test fails (default: FLAKY_RATE env var or 0.5)",
+    )
     args = parser.parse_args()
 
     token = os.environ.get("GITHUB_TOKEN")
@@ -214,7 +220,7 @@ def main():
         print("ERROR: set GITHUB_TOKEN environment variable first.", file=sys.stderr)
         sys.exit(1)
 
-    trigger_run(args.owner, args.repo, args.failure_type, token)
+    trigger_run(args.owner, args.repo, args.failure_type, token, flaky_rate=args.flaky_rate)
 
     print("Waiting a few seconds for the run to register...")
     time.sleep(6)

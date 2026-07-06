@@ -31,13 +31,15 @@ When pytest ran, `log_file` is consistently `"test/6_Run test suite.txt"`.
 
 ## Type 1 — Flaky / non-deterministic test failure
 
-**Injection:** `FAILURE_INJECTION=flaky_test` → `assert random.random() < 0.5`
+**Injection:** `FAILURE_INJECTION=flaky_test` → `assert random.random() >= FLAKY_RATE` (default `FLAKY_RATE=0.5`)
+
+Failure rate is configurable via the `FLAKY_RATE` env var (passed as a workflow input) or `--flaky-rate` in `trigger_and_fetch.py`.
 
 **Evidence fingerprint**
 
 | Field | Value |
 |---|---|
-| `had_failures` | `true` ~50% of runs, `false` ~50% |
+| `had_failures` | `true` at rate `FLAKY_RATE` (default ~50%), `false` at rate `1 − FLAKY_RATE` |
 | `failures_detail[].test_id` | `tests/test_calculator.py::test_injection_target` |
 | `failures_detail[].message` | `AssertionError: Flaky failure injected (non-deterministic)` |
 | `summary_line` | `"1 failed, 7 passed in …"` or `"8 passed in …"` |
@@ -152,7 +154,7 @@ These are scenarios where the correct label is **"ambiguous / insufficient evide
 |---|---|---|
 | Intermittent failure with no rerun history | Cannot distinguish flaky from a real intermittent regression without reruns | None — trigger `flaky_test` exactly once and suppress rerun history from the agent's tool responses. Already producible. |
 | Failure on a run where both a code change and a dependency update landed simultaneously | Cannot determine whether the code change or the env change caused the failure without a bisect | New injection mode required: current `FAILURE_INJECTION` values are mutually exclusive single modes. Need a combined mode (e.g., `FAILURE_INJECTION=regression_plus_env`) that applies both a code mutation and unsets `SIMULATED_DEPENDENCY` in the same workflow run. |
-| A test that sometimes passes, sometimes fails, with a failure rate of ~80% | High enough to suggest regression, low enough that flakiness cannot be ruled out | Parameterized flakiness rate required: `flaky_test` is hardcoded to `random.random() < 0.5`. Add a `FLAKY_RATE` env var read by the injected assertion so the rate can be set to 0.8 (or any target) without editing source. |
+| A test that sometimes passes, sometimes fails, with a failure rate of ~80% | High enough to suggest regression, low enough that flakiness cannot be ruled out | **Implemented.** Pass `--flaky-rate 0.8` to `trigger_and_fetch.py` (or set `FLAKY_RATE=0.8`). The workflow input forwards it to the runner; `test_calculator.py` reads it via `FLAKY_RATE` env var and asserts `random.random() >= FLAKY_RATE`. |
 
 In these cases the correct agent output is a ranked hypothesis list where no single hypothesis exceeds a confidence threshold (e.g., 0.6), and the `conclusion` field is `"ambiguous"` rather than a named failure type.
 
