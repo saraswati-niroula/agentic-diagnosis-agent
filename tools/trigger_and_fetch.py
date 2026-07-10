@@ -72,7 +72,7 @@ def get_latest_run(owner, repo, token):
     return runs[0]
 
 
-def poll_until_complete(owner, repo, token, run_id, timeout_seconds=180, interval_seconds=8):
+def poll_until_complete(owner, repo, token, run_id, timeout_seconds=300, interval_seconds=8):
     url = f"{GITHUB_API}/repos/{owner}/{repo}/actions/runs/{run_id}"
     headers = {
         "Authorization": f"Bearer {token}",
