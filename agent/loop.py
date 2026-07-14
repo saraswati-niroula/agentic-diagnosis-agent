@@ -146,6 +146,61 @@ QUERY_TEST_FAILURE_LOGS_SCHEMA = {
     },
 }
 
+QUERY_CI_RUN_HISTORY_SCHEMA = {
+    "name": "query_ci_run_history",
+    "description": (
+        "Fetch recent GitHub Actions workflow run conclusions and timestamps for this "
+        "repository. Returns run IDs, conclusions (success/failure/cancelled/skipped), "
+        "statuses, and ISO timestamps for the most recent runs. Use this to detect "
+        "whether failures are systematic across many runs (suggesting real_regression) "
+        "or intermittent (suggesting flaky_test). Pass run_ids from this result to "
+        "query_flakiness_history for per-test breakdown."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "limit": {
+                "type": "integer",
+                "description": "Number of recent runs to return (default 10, max 30).",
+            }
+        },
+        "required": [],
+    },
+}
+
+QUERY_FLAKINESS_HISTORY_SCHEMA = {
+    "name": "query_flakiness_history",
+    "description": (
+        "Check whether a specific test passed or failed across a set of prior workflow "
+        "runs. For each run_id provided, downloads the logs and checks whether the "
+        "given test_id appears in the failure list. Returns pass/fail per run, plus "
+        "aggregate failure_count and pass_count. Use this — after calling "
+        "query_ci_run_history to obtain run IDs — to distinguish a consistently "
+        "failing test (real_regression) from one that fails intermittently (flaky_test)."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "test_id": {
+                "type": "string",
+                "description": (
+                    "Test identifier to look up — e.g. 'test_flaky' or "
+                    "'tests/test_calculator.py::test_flaky'. Matched as a substring "
+                    "against the test IDs in each run's failure list."
+                ),
+            },
+            "run_ids": {
+                "type": "array",
+                "items": {"type": "integer"},
+                "description": (
+                    "GitHub Actions run IDs to check. Obtain from query_ci_run_history."
+                ),
+            },
+        },
+        "required": ["test_id", "run_ids"],
+    },
+}
+
 
 @dataclass
 class BeliefState:
@@ -459,6 +514,95 @@ def _make_query_test_failure_logs(owner: str, repo: str, token: str) -> Callable
     return query_test_failure_logs
 
 
+def _make_query_ci_run_history(owner: str, repo: str, token: str) -> Callable:
+    """Return a closure over GitHub credentials for the query_ci_run_history tool."""
+
+    def query_ci_run_history(limit: int = 10) -> dict:
+        limit = min(int(limit), 30)
+        url = f"{GITHUB_API}/repos/{owner}/{repo}/actions/runs"
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+        }
+        resp = requests.get(url, headers=headers, params={"per_page": limit})
+        resp.raise_for_status()
+        data = resp.json()
+        runs = [
+            {
+                "run_id": r["id"],
+                "conclusion": r.get("conclusion"),
+                "status": r.get("status"),
+                "created_at": r.get("created_at"),
+                "event": r.get("event"),
+            }
+            for r in data.get("workflow_runs", [])
+        ]
+        return {"runs": runs, "total_returned": len(runs)}
+
+    return query_ci_run_history
+
+
+def _make_query_flakiness_history(owner: str, repo: str, token: str) -> Callable:
+    """Return a closure over GitHub credentials for the query_flakiness_history tool."""
+
+    def _get_run_conclusion(run_id: int) -> str | None:
+        url = f"{GITHUB_API}/repos/{owner}/{repo}/actions/runs/{run_id}"
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+        }
+        resp = requests.get(url, headers=headers)
+        resp.raise_for_status()
+        return resp.json().get("conclusion")
+
+    def query_flakiness_history(test_id: str, run_ids: list) -> dict:
+        results = []
+        for run_id in run_ids:
+            try:
+                run_conclusion = _get_run_conclusion(run_id)
+                logs_url = fetch_logs_url(owner, repo, token, run_id)
+                if not logs_url:
+                    results.append({
+                        "run_id": run_id,
+                        "outcome": "logs_unavailable",
+                        "run_conclusion": run_conclusion,
+                    })
+                    continue
+                zip_bytes = download_zip(logs_url)
+                evidence = extract_evidence_from_zip(
+                    zip_bytes, run_conclusion=run_conclusion
+                )
+                if not evidence.get("had_failures"):
+                    outcome = "passed"
+                elif any(
+                    test_id in f.get("test_id", "")
+                    for f in evidence.get("failures_detail", [])
+                ):
+                    outcome = "failed"
+                else:
+                    outcome = "passed"  # run failed, but not this specific test
+                results.append({
+                    "run_id": run_id,
+                    "outcome": outcome,
+                    "run_conclusion": run_conclusion,
+                })
+            except Exception as exc:
+                results.append({
+                    "run_id": run_id,
+                    "outcome": "error",
+                    "error": str(exc),
+                })
+        return {
+            "test_id": test_id,
+            "results": results,
+            "failure_count": sum(1 for r in results if r["outcome"] == "failed"),
+            "pass_count": sum(1 for r in results if r["outcome"] == "passed"),
+            "total_runs_checked": len(results),
+        }
+
+    return query_flakiness_history
+
+
 if __name__ == "__main__":
     import argparse
     import time
@@ -554,11 +698,21 @@ if __name__ == "__main__":
         "query_test_failure_logs": _make_query_test_failure_logs(
             args.owner, args.repo, token
         ),
+        "query_ci_run_history": _make_query_ci_run_history(
+            args.owner, args.repo, token
+        ),
+        "query_flakiness_history": _make_query_flakiness_history(
+            args.owner, args.repo, token
+        ),
     }
 
     final = run_loop(
         belief_state,
-        tool_schemas=[QUERY_TEST_FAILURE_LOGS_SCHEMA],
+        tool_schemas=[
+            QUERY_TEST_FAILURE_LOGS_SCHEMA,
+            QUERY_CI_RUN_HISTORY_SCHEMA,
+            QUERY_FLAKINESS_HISTORY_SCHEMA,
+        ],
         tool_registry=tool_registry,
         backend=args.backend,
         model=model,
