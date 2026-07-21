@@ -23,6 +23,7 @@ import json
 import os
 import sys
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Callable
 
 import requests
@@ -151,10 +152,11 @@ QUERY_CI_RUN_HISTORY_SCHEMA = {
     "description": (
         "Fetch recent GitHub Actions workflow run conclusions and timestamps for this "
         "repository. Returns run IDs, conclusions (success/failure/cancelled/skipped), "
-        "statuses, and ISO timestamps for the most recent runs. Use this to detect "
-        "whether failures are systematic across many runs (suggesting real_regression) "
-        "or intermittent (suggesting flaky_test). Pass run_ids from this result to "
-        "query_flakiness_history for per-test breakdown."
+        "statuses, and ISO timestamps for the most recent runs matching the same "
+        "workflow trigger context as the current run. Runs from unrelated trigger "
+        "contexts are excluded automatically. Use this to detect whether failures are "
+        "systematic (suggesting real_regression) or intermittent (suggesting flaky_test). "
+        "Pass run_ids from this result to query_flakiness_history for per-test breakdown."
     ),
     "parameters": {
         "type": "object",
@@ -176,7 +178,10 @@ QUERY_FLAKINESS_HISTORY_SCHEMA = {
         "given test_id appears in the failure list. Returns pass/fail per run, plus "
         "aggregate failure_count and pass_count. Use this — after calling "
         "query_ci_run_history to obtain run IDs — to distinguish a consistently "
-        "failing test (real_regression) from one that fails intermittently (flaky_test)."
+        "failing test (real_regression) from one that fails intermittently (flaky_test). "
+        "Results are automatically filtered to runs matching the same workflow trigger "
+        "context as the current run; runs from unrelated trigger contexts are excluded "
+        "and reported as runs_skipped_wrong_type."
     ),
     "parameters": {
         "type": "object",
@@ -214,6 +219,14 @@ class BeliefState:
     conclusion_source: str | None = None      # "model_concluded" | "forced_budget_exhaustion"
     pre_override_belief: list[dict] | None = None  # diagnostic only — never use in metrics
     self_check_argument: str | None = None
+    run_id: int | None = None
+    # "inconsistent_label"    — conclusion disagrees with top hypothesis, no self-check abstention rationale
+    # "deliberate_abstention" — conclusion is "ambiguous", self-check argues genuine evidence overlap,
+    #                           top hypothesis confidence < 0.5 (evidence genuinely near-tied)
+    # "unjustified_hedge"     — conclusion is "ambiguous", self-check present but top confidence >= 0.5,
+    #                           indicating the model hedged against a signal sufficient to lean on
+    # None                    — conclusion matches top hypothesis (no mismatch)
+    mismatch_type: str | None = None
 
 
 def _uniform_prior() -> list[dict]:
@@ -307,6 +320,7 @@ def think_step(
     backend: str = "cerebras",
     model: str = "gpt-oss-120b",
     timeout: int = 300,
+    turn: int = 0,
 ) -> dict:
     """Run one LLM turn and dispatch the resulting action. Mutates belief_state."""
     prompt = PROMPT_TEMPLATE.format(
@@ -384,6 +398,43 @@ def think_step(
         belief_state.conclusion = step.get("conclusion", "ambiguous")
         belief_state.conclusion_source = "model_concluded"
         belief_state.self_check_argument = step.get("self_check_argument", "")
+
+        # Classify conclusion/belief relationship into one of four cases:
+        #   None                    — conclusion matches top hypothesis (no mismatch)
+        #   "deliberate_abstention" — conclusion is "ambiguous", self-check argues genuine
+        #                             evidence overlap, top confidence < 0.5 (near-tied)
+        #   "unjustified_hedge"     — conclusion is "ambiguous", self-check present but
+        #                             top confidence >= 0.5 (model had enough to lean, hedged anyway)
+        #   "inconsistent_label"    — conclusion disagrees with top hypothesis without a
+        #                             self-check abstention rationale (likely an error)
+        hypotheses = step.get("hypotheses", [])
+        mismatch_type = None
+        if hypotheses:
+            top = max(hypotheses, key=lambda h: h.get("confidence", 0))
+            top_label = top["label"]
+            top_confidence = top.get("confidence", 0)
+            stated = step.get("conclusion")
+            if stated != top_label:
+                self_check = step.get("self_check_argument") or ""
+                if stated == "ambiguous" and self_check.strip():
+                    mismatch_type = "unjustified_hedge" if top_confidence >= 0.5 else "deliberate_abstention"
+                else:
+                    mismatch_type = "inconsistent_label"
+        step["mismatch_type"] = mismatch_type
+        belief_state.mismatch_type = mismatch_type
+
+        # Write raw response + parsed step to a local log file for post-hoc inspection.
+        os.makedirs("logs", exist_ok=True)
+        run_id_tag = belief_state.run_id if belief_state.run_id is not None else "unknown"
+        log_path = f"logs/conclude_{run_id_tag}_{turn}.json"
+        with open(log_path, "w") as _f:
+            json.dump({
+                "run_id": belief_state.run_id,
+                "turn": turn,
+                "raw_response": raw,
+                "parsed_step": step,
+                "mismatch_type": mismatch_type,
+            }, _f, indent=2)
 
     return step
 
@@ -463,7 +514,7 @@ def run_loop(
             print("[loop] budget exhausted — concluding ambiguous")
             break
 
-        step = think_step(belief_state, tool_schemas, tool_registry, backend, model, timeout)
+        step = think_step(belief_state, tool_schemas, tool_registry, backend, model, timeout, turn=turn)
 
         label = f"action={step['action']}"
         if step["action"] == "call_tool":
@@ -471,6 +522,9 @@ def run_loop(
             _force_belief_update(belief_state, backend, model, timeout)
         elif step["action"] == "conclude":
             label += f" conclusion={step.get('conclusion')}"
+            mt = step.get("mismatch_type")
+            if mt:
+                label += f" [{mt}]"
         print(f"[turn {turn}] {label}")
 
     if belief_state.status == "running":
@@ -509,41 +563,119 @@ def _make_query_test_failure_logs(owner: str, repo: str, token: str) -> Callable
         evidence = extract_evidence_from_zip(zip_bytes, run_conclusion=run.get("conclusion"))
         evidence["run_id"] = run_id
         evidence["run_conclusion"] = run.get("conclusion")
+        # failure_injection_type is an internal eval-infrastructure field — not
+        # surfaced to the model so it cannot read the ground-truth injection label.
+        evidence.pop("failure_injection_type", None)
         return evidence
 
     return query_test_failure_logs
 
 
-def _make_query_ci_run_history(owner: str, repo: str, token: str) -> Callable:
-    """Return a closure over GitHub credentials for the query_ci_run_history tool."""
+def _make_query_ci_run_history(
+    owner: str, repo: str, token: str, initial_run_id: int
+) -> Callable:
+    """Return a closure over GitHub credentials for the query_ci_run_history tool.
+
+    Automatically filters returned runs to match the FAILURE_INJECTION type of the
+    current run (initial_run_id), for the same reason as _make_query_flakiness_history:
+    unfiltered history mixes scenario types, producing misleading failure-rate signals
+    and giving the model run IDs it would then query with query_test_failure_logs,
+    importing irrelevant failure messages into its reasoning.
+
+    When the current run's injection type cannot be determined (e.g. ci_infra_issue
+    where FAILURE_INJECTION may not appear in the available step logs), filtering is
+    skipped and all runs are returned unchanged.
+    """
+    _current_fit: list[str | None] = [None]
+    _fit_fetched: list[bool] = [False]
+
+    def _get_current_failure_injection_type() -> str | None:
+        if _fit_fetched[0]:
+            return _current_fit[0]
+        _fit_fetched[0] = True
+        try:
+            logs_url = fetch_logs_url(owner, repo, token, initial_run_id)
+            if logs_url:
+                ev = extract_evidence_from_zip(download_zip(logs_url))
+                _current_fit[0] = ev.get("failure_injection_type")
+        except Exception:
+            pass
+        return _current_fit[0]
 
     def query_ci_run_history(limit: int = 10) -> dict:
+        current_fit = _get_current_failure_injection_type()
         limit = min(int(limit), 30)
         url = f"{GITHUB_API}/repos/{owner}/{repo}/actions/runs"
         headers = {
             "Authorization": f"Bearer {token}",
             "Accept": "application/vnd.github+json",
         }
-        resp = requests.get(url, headers=headers, params={"per_page": limit})
+        # Fetch more than requested to have headroom after filtering.
+        fetch_limit = min(limit * 4, 100) if current_fit else limit
+        resp = requests.get(url, headers=headers, params={"per_page": fetch_limit})
         resp.raise_for_status()
-        data = resp.json()
-        runs = [
-            {
+        raw_runs = resp.json().get("workflow_runs", [])
+
+        runs = []
+        skipped = 0
+        for r in raw_runs:
+            if len(runs) >= limit:
+                break
+            if current_fit:
+                try:
+                    logs_url = fetch_logs_url(owner, repo, token, r["id"])
+                    if not logs_url:
+                        skipped += 1
+                        continue
+                    ev = extract_evidence_from_zip(download_zip(logs_url))
+                    fit = ev.get("failure_injection_type")
+                    if fit != current_fit:
+                        skipped += 1
+                        continue
+                except Exception:
+                    skipped += 1
+                    continue
+            runs.append({
                 "run_id": r["id"],
                 "conclusion": r.get("conclusion"),
                 "status": r.get("status"),
                 "created_at": r.get("created_at"),
                 "event": r.get("event"),
-            }
-            for r in data.get("workflow_runs", [])
-        ]
-        return {"runs": runs, "total_returned": len(runs)}
+            })
+
+        result = {"runs": runs, "runs_returned": len(runs)}
+        if current_fit:
+            result["runs_skipped_wrong_type"] = skipped
+        return result
 
     return query_ci_run_history
 
 
-def _make_query_flakiness_history(owner: str, repo: str, token: str) -> Callable:
-    """Return a closure over GitHub credentials for the query_flakiness_history tool."""
+def _make_query_flakiness_history(
+    owner: str, repo: str, token: str, initial_run_id: int
+) -> Callable:
+    """Return a closure over GitHub credentials for the query_flakiness_history tool.
+
+    Automatically filters historical runs to match the same FAILURE_INJECTION type
+    as the current run (initial_run_id) so that runs from unrelated trigger contexts
+    do not contaminate pass/fail counts. The failure_injection_type is never exposed
+    in the tool output to avoid surfacing the ground-truth injection label to the model.
+    """
+    _current_fit: list[str | None] = [None]   # mutable cell for lazy init
+    _fit_fetched: list[bool] = [False]
+
+    def _get_current_failure_injection_type() -> str | None:
+        if _fit_fetched[0]:
+            return _current_fit[0]
+        _fit_fetched[0] = True
+        try:
+            logs_url = fetch_logs_url(owner, repo, token, initial_run_id)
+            if logs_url:
+                ev = extract_evidence_from_zip(download_zip(logs_url))
+                _current_fit[0] = ev.get("failure_injection_type")
+        except Exception:
+            pass
+        return _current_fit[0]
 
     def _get_run_conclusion(run_id: int) -> str | None:
         url = f"{GITHUB_API}/repos/{owner}/{repo}/actions/runs/{run_id}"
@@ -556,6 +688,7 @@ def _make_query_flakiness_history(owner: str, repo: str, token: str) -> Callable
         return resp.json().get("conclusion")
 
     def query_flakiness_history(test_id: str, run_ids: list) -> dict:
+        current_fit = _get_current_failure_injection_type()
         results = []
         for run_id in run_ids:
             try:
@@ -572,6 +705,14 @@ def _make_query_flakiness_history(owner: str, repo: str, token: str) -> Callable
                 evidence = extract_evidence_from_zip(
                     zip_bytes, run_conclusion=run_conclusion
                 )
+                fit = evidence.get("failure_injection_type")
+                if current_fit and fit != current_fit:
+                    results.append({
+                        "run_id": run_id,
+                        "outcome": "skipped_wrong_type",
+                        "run_conclusion": run_conclusion,
+                    })
+                    continue
                 if not evidence.get("had_failures"):
                     outcome = "passed"
                 elif any(
@@ -592,12 +733,14 @@ def _make_query_flakiness_history(owner: str, repo: str, token: str) -> Callable
                     "outcome": "error",
                     "error": str(exc),
                 })
+        counted = [r for r in results if r["outcome"] not in ("skipped_wrong_type", "logs_unavailable", "error")]
         return {
             "test_id": test_id,
             "results": results,
-            "failure_count": sum(1 for r in results if r["outcome"] == "failed"),
-            "pass_count": sum(1 for r in results if r["outcome"] == "passed"),
-            "total_runs_checked": len(results),
+            "failure_count": sum(1 for r in counted if r["outcome"] == "failed"),
+            "pass_count": sum(1 for r in counted if r["outcome"] == "passed"),
+            "runs_counted": len(counted),
+            "runs_skipped_wrong_type": sum(1 for r in results if r["outcome"] == "skipped_wrong_type"),
         }
 
     return query_flakiness_history
@@ -692,6 +835,7 @@ if __name__ == "__main__":
         tool_calls_used=0,
         tool_call_budget=args.tool_budget,
         status="running",
+        run_id=run_id,
     )
 
     tool_registry = {
@@ -699,10 +843,10 @@ if __name__ == "__main__":
             args.owner, args.repo, token
         ),
         "query_ci_run_history": _make_query_ci_run_history(
-            args.owner, args.repo, token
+            args.owner, args.repo, token, run_id
         ),
         "query_flakiness_history": _make_query_flakiness_history(
-            args.owner, args.repo, token
+            args.owner, args.repo, token, run_id
         ),
     }
 
