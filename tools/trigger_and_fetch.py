@@ -116,6 +116,8 @@ def download_zip(presigned_url):
 # 2024-01-01T00:00:00.0000000Z FAILED tests/...
 _TIMESTAMP_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z\s?")
 
+_FAILURE_INJECTION_RE = re.compile(r"FAILURE_INJECTION:\s*(\S+)")
+
 
 def _strip_timestamps(text):
     return "\n".join(_TIMESTAMP_RE.sub("", line) for line in text.splitlines())
@@ -149,9 +151,14 @@ def parse_pytest_output(text):
                 short_summary_lines.append(line)
                 m = re.match(r"(?:FAILED|ERROR)\s+(\S+)\s+-\s+(.*)", line)
                 if m:
+                    # Strip pytest's assertion "where" chain from the message.
+                    # The chain (lines starting with " +  where") reveals
+                    # source-level details like random.random() method names.
+                    raw_msg = m.group(2).strip()
+                    message = raw_msg.split("\n +  where")[0].strip()
                     failures_detail.append({
                         "test_id": m.group(1),
-                        "message": m.group(2).strip(),
+                        "message": message,
                     })
 
     # Final summary line: "== 1 failed, 7 passed in 0.23s =="
@@ -171,23 +178,47 @@ def parse_pytest_output(text):
     }
 
 
+def _extract_failure_injection(log_text: str) -> str | None:
+    """Extract the FAILURE_INJECTION env-var value from a GitHub Actions step log."""
+    m = _FAILURE_INJECTION_RE.search(log_text)
+    return m.group(1) if m else None
+
+
 def extract_evidence_from_zip(zip_bytes, run_conclusion=None):
     """
     Unzip the GitHub Actions log archive, locate the pytest step log, and
-    return parsed evidence.  The zip contains one .txt per step named like:
-        test/3_Run test suite.txt
+    return parsed evidence.
 
-    If the "Run test suite" step log is absent (pytest never ran because a
-    pre-test step failed), returns a distinct evidence shape with
-    no_test_output=True — that absence is itself a diagnostic signal.
+    Two archive formats are handled:
+      - Per-step files (old format): "test/N_Run test suite.txt"
+      - Combined log  (new format):  "0_test.txt"  (all steps in one file)
+
+    If neither is present (pytest never ran because a pre-test step failed),
+    returns a distinct evidence shape with no_test_output=True — that absence
+    is itself a diagnostic signal.
+
+    Always includes failure_injection_type (the FAILURE_INJECTION env-var value
+    from the step log) so callers can filter history to same-scenario runs.
     """
     with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
         names = zf.namelist()
+        # Prefer per-step file; fall back to combined log introduced ~2026-07
         target = next(
             (n for n in names if "run test suite" in n.lower()),
             None,
         )
         if target is None:
+            target = next((n for n in names if n == "0_test.txt"), None)
+        if target is None:
+            # No pytest log — try extracting failure_injection_type from any
+            # available step file (FAILURE_INJECTION appears in every step's env block)
+            failure_injection_type = None
+            for name in sorted(names):
+                if name.endswith(".txt") and name != "test/system.txt":
+                    candidate = zf.read(name).decode("utf-8", errors="replace")
+                    failure_injection_type = _extract_failure_injection(candidate)
+                    if failure_injection_type:
+                        break
             return {
                 "had_failures": run_conclusion == "failure",
                 "failures_detail": [],
@@ -195,10 +226,29 @@ def extract_evidence_from_zip(zip_bytes, run_conclusion=None):
                 "summary_line": "",
                 "no_test_output": True,
                 "available_step_logs": sorted(names),
+                "failure_injection_type": failure_injection_type,
             }
         log_text = zf.read(target).decode("utf-8", errors="replace")
         evidence = parse_pytest_output(log_text)
+        failure_injection_type = _extract_failure_injection(log_text)
+        # Guard against the combined log (0_test.txt) being present but containing
+        # no pytest output — happens for ci_infra_issue where a pre-test step exits
+        # before pytest runs.  parse_pytest_output returns had_failures=False in that
+        # case, which would mask the real failure signal.  Detect by the absence of
+        # any parsed pytest content and fall back to the no_test_output shape.
+        no_pytest_content = not evidence["summary_line"] and not evidence["failures_detail"]
+        if no_pytest_content and run_conclusion == "failure":
+            return {
+                "had_failures": True,
+                "failures_detail": [],
+                "short_summary": "",
+                "summary_line": "",
+                "no_test_output": True,
+                "available_step_logs": sorted(names),
+                "failure_injection_type": failure_injection_type,
+            }
         evidence["log_file"] = target
+        evidence["failure_injection_type"] = failure_injection_type
         return evidence
 
 
