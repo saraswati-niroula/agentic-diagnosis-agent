@@ -4,3 +4,4 @@ __pycache__/
 venv/
 .pytest_cache/
 conclude_*
+sweep_*
