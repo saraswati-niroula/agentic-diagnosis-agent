@@ -141,7 +141,9 @@ Failure rate is configurable via the `FLAKY_RATE` env var (passed as a workflow 
 
 **Distinguishing feature (with rerun history):** failure rate is ~80%, not 100% — eventually visible across 10+ reruns. Without rerun history, a single run is indistinguishable from `real_regression`. The error message is identical to `flaky_test`. This is deliberately the hardest ambiguity case: no single tool call resolves it on one run.
 
-**Evaluation note:** for this scenario, suppress rerun history from the agent's tool responses (trigger exactly once and do not expose prior run results). The correct label is `"ambiguous"`, not `real_regression` or `flaky_test`.
+**Statistical justification for permanent "ambiguous" ground truth:** Even when rerun history is available via `query_ci_run_history` and `query_flakiness_history`, the ground truth remains `"ambiguous"` rather than `flaky_test`. A practical limit of ~10 recent workflow runs — which is what `query_ci_run_history` can return from a low-volume repository — cannot statistically distinguish an ~80%-reliability flaky test from an intermittent real bug (e.g., a race condition or environment-dependent regression) with the same empirical failure rate. Both hypotheses produce indistinguishable frequency patterns over any sample size realistically obtainable in this project. A Bayesian update on 8/10 failures cannot rule out a regression with ~80% reproduction rate: the likelihoods are identical by construction. Increasing the sample to 30 or 50 runs would narrow the confidence interval but not resolve the ambiguity at this failure rate — a regression with 75–85% reproduction probability is a legitimate and plausible failure mode, not a theoretical edge case. The ambiguity here is therefore **deliberate and permanent by design**, not a limitation expected to resolve with more tool calls. An agent that concludes `flaky_test` or `real_regression` with high confidence after checking 10 runs of this scenario is overconfident, regardless of which label it picks.
+
+**Evaluation note:** do not suppress rerun history — let the agent use all available tools. The correct label is `"ambiguous"` regardless of what the historical sample shows. An agent that correctly identifies the ambiguity and concludes `"ambiguous"` with appropriately hedged confidence is scoring correctly on RQ3 even if the historical sample happened to show a pattern consistent with one hypothesis. Confidence above ~0.65 on either `flaky_test` or `real_regression` for this scenario should be treated as a calibration failure in the eval harness.
 
 ---
 
@@ -195,6 +197,113 @@ The cells below describe evidence states that are indistinguishable without addi
 5. **Regression+RH (T7) vs. Dependency** — both show `SIMULATED_DEPENDENCY` absent and a deterministic failure. The discriminator is the `failures_detail[].message` field: T7 produces `"Real regression injected (deterministic)"`, not `"Environment/dependency failure injected"`. An agent that routes on env state before reading the assertion message will mis-classify. Resolution requires the agent to read the failure message before issuing a conclusion.
 
 **Caveat on "separates immediately" cells:** the diagonal claims above assume the tool layer is working correctly. A distinction that is logically immediate (e.g., `no_test_output: true` rules out a test failure) is only actually immediate if the extractor surfaces that field. This project encountered this failure mode directly: an early version of the log parser silently returned empty evidence rather than populating `no_test_output`, making a CI infra failure look identical to a flaky test with no output. The "immediate" separations in this table are therefore conditional on a correctly functioning tool layer — tool reliability is itself a load-bearing assumption in the diagnosis pipeline, and a legitimate point of fragility to acknowledge in any evaluation write-up.
+
+---
+
+## Tool-architecture mismatch: git-diff and lockfile-diff tools
+
+### query_git_diff — removed from tool registry
+
+`query_git_diff` was implemented and wired into the tool registry, then removed after
+confirming that git commit history is not a useful diagnostic signal for this study's
+injection methodology.
+
+**Why it does not apply here.** All injection logic in `toy-repo-ci-test` lives in
+`tests/test_calculator.py` as env-var-branching committed in the repository's initial
+commit:
+
+```python
+if FAILURE_MODE == "real_regression":
+    assert (multiply(4, 3) - 1) == 12    # deterministic failure
+elif FAILURE_MODE == "flaky_test":
+    assert random.random() >= FLAKY_RATE  # stochastic
+# ... etc.
+```
+
+Every scenario is triggered by `workflow_dispatch` with a `failure_type` input; the
+code never changes between runs. A diff between the latest commit and its parent shows
+only scaffolding changes (assert message rewording, new scenario additions) — not the
+mutation that explains the current run's failure, because the mutation is not encoded
+in the commit history at all. In a real codebase, by contrast, a `real_regression`
+scenario would typically be caused by a recent code change, and a git diff between the
+failing and last-passing commits would expose it. The tool is architecturally correct
+for that use case; it is simply not applicable to this study's injection approach.
+
+**Why this matters for result interpretation.** The absence of `query_git_diff` from
+the eval harness is a scope constraint, not a finding about the tool's usefulness. Any
+eval results claiming that "git-diff evidence did not help distinguish regression from
+flakiness" would be vacuously true for this corpus and should not be generalized. The
+overlap-map entry for "Real regression vs. Dependency" (above) lists `query_git_diff`
+as a discriminator — that relationship is real; it just cannot be demonstrated with
+this injection model.
+
+**Future work.** A natural extension is a real-commit injection architecture: each
+scenario is encoded as a separate branch or tag, so triggering a `real_regression` run
+means checking out a commit that actually contains the regression mutation in source.
+That would make `query_git_diff` load-bearing and would let the eval harness test
+whether agents correctly use commit history as a causal signal — currently untestable.
+
+---
+
+### query_dependency_lockfile_diff — decision not to build
+
+`query_dependency_lockfile_diff` was listed in the overlap map as a discriminator for
+the "Real regression vs. Dependency" and "Flaky vs. Dependency" overlaps. The same
+architectural mismatch applies.
+
+**Why it does not apply here.** The `env_dependency` and `regression_with_redherring`
+scenarios are triggered by the *absence* of the `SIMULATED_DEPENDENCY` environment
+variable at runner startup — not by any change to a requirements file or lockfile.
+There is no lockfile diff to fetch: the dependency "change" exists only as an env-var
+state in the runner, invisible to the GitHub compare API.
+
+In a real codebase, a dependency failure would typically be preceded by a change to
+`requirements.txt`, `pyproject.toml`, or a lockfile, and `query_dependency_lockfile_diff`
+could surface that. For this study, fetching such a diff would always return empty
+(no file changed), which is itself a signal in a real corpus but a misleading absence
+here — the env change was never recorded in version control at all.
+
+**Decision:** do not implement `query_dependency_lockfile_diff`. Building it and then
+discovering that it always returns empty results for these scenarios would introduce
+spurious negative evidence (the model might incorrectly treat "no lockfile diff" as
+evidence against an env-dependency hypothesis, when the correct interpretation is that
+the tool is inapplicable). The same future-work extension that makes `query_git_diff`
+meaningful (real-commit injection) would also make a lockfile-diff tool meaningful —
+the two tools are contingent on the same architectural precondition.
+
+---
+
+### query_ci_infra_status — removed after empirical confirmation
+
+`query_ci_infra_status` queried the public githubstatus.com incidents API and was
+wired into the tool registry to let the agent check for a documented GitHub Actions
+platform incident around a failing run's timestamp. It was exercised across 3 runs of
+the `ci_infra_issue` scenario. In all 3, it correctly reported no active GitHub
+incidents at the failure timestamp — and in all 3, the model treated that absence as
+evidence *against* `ci_infra_issue`, converging instead on `env_dependency` (wrong in
+all 3 cases).
+
+**Why it does not apply here.** As documented above (Type 4), `ci_infra_issue` in this
+study's injection methodology is triggered by the workflow step "Simulate CI
+infrastructure failure" exiting 1 before pytest runs — a scripted, repository-local
+failure, never a real GitHub platform incident. "No GitHub Actions incidents at this
+timestamp" is therefore structurally guaranteed to be true regardless of ground truth;
+it carries zero information about whether *this* run's failure is infra-caused. This is
+the same architectural mismatch as `query_git_diff` and `query_dependency_lockfile_diff`
+above: a tool that would be genuinely diagnostic against a real-world failure surface
+(an actual GitHub outage correlated with a real incident report) is inapplicable to an
+injection methodology that never produces the condition the tool is built to detect.
+
+**Note on sequencing.** This exclusion was decided during Phase 3 development, prior to
+the eval harness commit freeze and prior to any formal sweep. It is not a post-hoc,
+result-driven exclusion made after seeing aggregate accuracy numbers — it follows the
+same reasoning already applied to `query_git_diff` and `query_dependency_lockfile_diff`,
+confirmed empirically on 3 individual runs rather than inferred by analogy alone.
+
+**What remains available.** The taxonomy's actual documented discriminator for
+`ci_infra_issue` — `no_test_output: true` combined with `had_failures: true` (Type 4,
+above), sourced from `query_test_failure_logs` / `query_ci_run_history` — is unaffected
+by this removal and remains the intended path to correctly identifying this scenario.
 
 ---
 

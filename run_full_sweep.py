@@ -15,11 +15,15 @@ Usage:
     python3 run_full_sweep.py --owner OWNER --repo REPO --backend cerebras
 
 Notes:
-- Scenarios with stochastic outcomes (flaky_test, ambiguous_flaky_or_regression)
-  do not have a single fixed "correct" conclusion — the script prints the
-  observed conclusion and flags these rows for manual/contextual judgment
-  rather than a strict pass/fail, consistent with how they've been handled
-  in research_notes.md.
+- Ground truth is derived from github_conclusion, not scenario name: if the
+  run didn't actually fire (github_conclusion == "success"), ground truth is
+  "healthy" regardless of what failure type the scenario was configured to
+  inject. Only fired runs are scored against the scenario's injected type.
+- Stochastic scenarios (flaky_test, ambiguous_flaky_or_regression) can go
+  either way on a single run. Non-firing runs of these scenarios are scored
+  as "healthy" like any other non-firing run, and flagged via
+  scenario_did_not_trigger in each result / "[did not trigger]" in the
+  summary table, so they're visible without being excluded from scoring.
 - Results are saved to sweep_results.json for later reference, in addition
   to the printed table.
 """
@@ -37,30 +41,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__))))
 from agent.loop import (  # noqa: E402
     ALLOWED_HYPOTHESES,
     BeliefState,
-    QUERY_TEST_FAILURE_LOGS_SCHEMA,
-    _make_query_test_failure_logs,
+    build_tool_registry,
     _uniform_prior,
     run_loop,
 )
-
-# Import the other tool factories + schemas the same way loop.py's __main__ does.
-# If your loop.py uses different names for these, adjust the imports below to match.
-try:
-    from agent.loop import (  # noqa: E402
-        QUERY_CI_RUN_HISTORY_SCHEMA,
-        QUERY_FLAKINESS_HISTORY_SCHEMA,
-        _make_query_ci_run_history,
-        _make_query_flakiness_history,
-    )
-    HAVE_EXTRA_TOOLS = True
-except ImportError:
-    HAVE_EXTRA_TOOLS = False
-    print(
-        "WARNING: could not import query_ci_run_history / query_flakiness_history "
-        "tool factories or schemas from agent.loop — check the exact names in your "
-        "file and adjust this script's imports. Continuing with query_test_failure_logs only.",
-        file=sys.stderr,
-    )
 
 from tools.trigger_and_fetch import (  # noqa: E402
     get_latest_run,
@@ -68,11 +52,13 @@ from tools.trigger_and_fetch import (  # noqa: E402
     trigger_run,
 )
 
-# Ground truth per scenario. "STOCHASTIC" scenarios have no single fixed
-# correct answer — flagged for manual/contextual judgment in the summary.
+# Ground truth per scenario, i.e. the injected failure type when the run
+# actually fires (github_conclusion == "failure"). When a scenario doesn't
+# fire (github_conclusion == "success"), ground truth is "healthy" regardless
+# of scenario — see the override in main() below.
 SCENARIOS = [
     ("none", "healthy"),
-    ("flaky_test", "STOCHASTIC"),
+    ("flaky_test", "flaky_test"),
     ("real_regression", "real_regression"),
     ("env_dependency", "env_dependency"),
     ("schema_change", "schema_change"),
@@ -80,6 +66,11 @@ SCENARIOS = [
     ("ambiguous_flaky_or_regression", "ambiguous"),
     ("regression_with_redherring", "real_regression"),
 ]
+
+# Scenario types whose trigger is probabilistic — a single run may or may not
+# actually fire the injected failure. Used only to flag non-firing runs for
+# the results table, not to exclude them from scoring.
+STOCHASTIC_SCENARIO_TYPES = {"flaky_test", "ambiguous_flaky_or_regression"}
 
 
 def run_one_scenario(owner, repo, failure_type, backend, model, token, tool_budget, llm_timeout):
@@ -109,20 +100,7 @@ def run_one_scenario(owner, repo, failure_type, backend, model, token, tool_budg
         run_id=run_id,
     )
 
-    tool_registry = {
-        "query_test_failure_logs": _make_query_test_failure_logs(owner, repo, token),
-    }
-    tool_schemas = [QUERY_TEST_FAILURE_LOGS_SCHEMA]
-
-    if HAVE_EXTRA_TOOLS:
-        tool_registry["query_ci_run_history"] = _make_query_ci_run_history(
-            owner, repo, token, initial_run_id=run_id
-        )
-        tool_registry["query_flakiness_history"] = _make_query_flakiness_history(
-            owner, repo, token, initial_run_id=run_id
-        )
-        tool_schemas.append(QUERY_CI_RUN_HISTORY_SCHEMA)
-        tool_schemas.append(QUERY_FLAKINESS_HISTORY_SCHEMA)
+    tool_registry, tool_schemas = build_tool_registry(owner, repo, token, run_id)
 
     final = run_loop(
         belief_state,
@@ -191,16 +169,17 @@ def main():
             args.owner, args.repo, failure_type, args.backend, model,
             token, args.tool_budget, args.llm_timeout,
         )
-        result["ground_truth"] = ground_truth
-        # flaky_test at flaky_rate=0.5: if the run passed, the correct
-        # conclusion is "healthy" (deterministic — no failure = healthy).
-        # Only the failure case is truly stochastic (single run can't
-        # distinguish flaky from real_regression).
-        if (
-            ground_truth == "STOCHASTIC"
-            and result.get("github_conclusion") == "success"
-        ):
+        # Ground truth branches on whether the run actually fired, not on
+        # scenario name: a scenario that didn't trigger the injected failure
+        # is a "healthy" run regardless of what it was configured to inject.
+        if result.get("github_conclusion") == "failure":
+            result["ground_truth"] = ground_truth
+        else:
             result["ground_truth"] = "healthy"
+        result["scenario_did_not_trigger"] = (
+            failure_type in STOCHASTIC_SCENARIO_TYPES
+            and result.get("github_conclusion") == "success"
+        )
         results.append(result)
 
         if i < len(scenarios) - 1:
@@ -220,11 +199,9 @@ def main():
             continue
         gt = r["ground_truth"]
         concl = r["conclusion"]
-        if gt == "STOCHASTIC":
-            correct = "n/a (stochastic)"
-        else:
-            correct = "YES" if concl == gt else "NO"
-        print(f"{r['failure_type']:<32} {gt:<16} {str(concl):<16} {str(r['conclusion_source']):<24} {correct:<10}")
+        correct = "YES" if concl == gt else "NO"
+        trigger_note = " [did not trigger]" if r.get("scenario_did_not_trigger") else ""
+        print(f"{r['failure_type']:<32} {gt:<16} {str(concl):<16} {str(r['conclusion_source']):<24} {correct:<10}{trigger_note}")
 
     # --- Save full results ---
     os.makedirs("results", exist_ok=True)

@@ -36,6 +36,9 @@ from tools.trigger_and_fetch import (
 )
 
 GITHUB_API = "https://api.github.com"
+GITHUB_STATUS_INCIDENTS_URL = "https://www.githubstatus.com/api/v2/incidents.json"
+# Component ID for "Actions" on githubstatus.com — confirmed via /api/v2/summary.json.
+GITHUB_ACTIONS_COMPONENT_ID = "br0l2tvcx85d"
 
 ALLOWED_HYPOTHESES = [
     "flaky_test",
@@ -203,6 +206,37 @@ QUERY_FLAKINESS_HISTORY_SCHEMA = {
             },
         },
         "required": ["test_id", "run_ids"],
+    },
+}
+
+
+QUERY_CI_INFRA_STATUS_SCHEMA = {
+    "name": "query_ci_infra_status",
+    "description": (
+        "Check whether GitHub documented an external infrastructure incident affecting "
+        "GitHub Actions around the time of a specific CI run. Queries the public "
+        "githubstatus.com API and returns any incidents that were active at the given "
+        "timestamp. Use this when the evidence suggests a systemic CI failure with no "
+        "test output and no code change, to determine whether the failure may be "
+        "explained by a real GitHub outage rather than a repository-level cause. "
+        "IMPORTANT: The API returns at most 50 incidents and covers approximately the "
+        "last 10 weeks. If the queried timestamp falls outside this window, the tool "
+        "reports timestamp_within_coverage: false — a 'no incidents found' result in "
+        "that case cannot be taken as evidence that no outage occurred."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "timestamp": {
+                "type": "string",
+                "description": (
+                    "ISO 8601 timestamp of the CI run to check — use the run's "
+                    "created_at value (e.g. '2026-07-19T23:40:00Z'). The tool checks "
+                    "whether a documented GitHub Actions incident was active at this time."
+                ),
+            }
+        },
+        "required": ["timestamp"],
     },
 }
 
@@ -392,51 +426,62 @@ def think_step(
         belief_state.belief_trajectory.append(_snapshot(belief_state))
 
     elif action == "conclude":
-        belief_state.current_belief = step.get("hypotheses", belief_state.current_belief)
-        belief_state.belief_trajectory.append(_snapshot(belief_state))
-        belief_state.status = "concluded"
-        belief_state.conclusion = step.get("conclusion", "ambiguous")
-        belief_state.conclusion_source = "model_concluded"
-        belief_state.self_check_argument = step.get("self_check_argument", "")
-
-        # Classify conclusion/belief relationship into one of four cases:
-        #   None                    — conclusion matches top hypothesis (no mismatch)
-        #   "deliberate_abstention" — conclusion is "ambiguous", self-check argues genuine
-        #                             evidence overlap, top confidence < 0.5 (near-tied)
-        #   "unjustified_hedge"     — conclusion is "ambiguous", self-check present but
-        #                             top confidence >= 0.5 (model had enough to lean, hedged anyway)
-        #   "inconsistent_label"    — conclusion disagrees with top hypothesis without a
-        #                             self-check abstention rationale (likely an error)
-        hypotheses = step.get("hypotheses", [])
-        mismatch_type = None
-        if hypotheses:
-            top = max(hypotheses, key=lambda h: h.get("confidence", 0))
-            top_label = top["label"]
-            top_confidence = top.get("confidence", 0)
-            stated = step.get("conclusion")
-            if stated != top_label:
-                self_check = step.get("self_check_argument") or ""
-                if stated == "ambiguous" and self_check.strip():
-                    mismatch_type = "unjustified_hedge" if top_confidence >= 0.5 else "deliberate_abstention"
-                else:
-                    mismatch_type = "inconsistent_label"
-        step["mismatch_type"] = mismatch_type
-        belief_state.mismatch_type = mismatch_type
-
-        # Write raw response + parsed step to a local log file for post-hoc inspection.
-        os.makedirs("logs", exist_ok=True)
-        run_id_tag = belief_state.run_id if belief_state.run_id is not None else "unknown"
-        log_path = f"logs/conclude_{run_id_tag}_{turn}.json"
-        with open(log_path, "w") as _f:
-            json.dump({
-                "run_id": belief_state.run_id,
-                "turn": turn,
-                "raw_response": raw,
-                "parsed_step": step,
-                "mismatch_type": mismatch_type,
-            }, _f, indent=2)
+        _apply_conclusion(belief_state, step, turn, raw)
 
     return step
+
+
+def _apply_conclusion(belief_state: BeliefState, step: dict, turn: int, raw: str) -> None:
+    """Apply a validated 'conclude' action: set status/conclusion/self-check,
+    classify mismatch_type, and write the conclude log.
+
+    Shared by the normal per-turn conclude path (think_step) and the final
+    conclude-only turn granted on budget/turn-limit exhaustion (_force_conclude),
+    so both paths log and classify identically.
+    """
+    belief_state.current_belief = step.get("hypotheses", belief_state.current_belief)
+    belief_state.belief_trajectory.append(_snapshot(belief_state))
+    belief_state.status = "concluded"
+    belief_state.conclusion = step.get("conclusion", "ambiguous")
+    belief_state.conclusion_source = "model_concluded"
+    belief_state.self_check_argument = step.get("self_check_argument", "")
+
+    # Classify conclusion/belief relationship into one of four cases:
+    #   None                    — conclusion matches top hypothesis (no mismatch)
+    #   "deliberate_abstention" — conclusion is "ambiguous", self-check argues genuine
+    #                             evidence overlap, top confidence < 0.5 (near-tied)
+    #   "unjustified_hedge"     — conclusion is "ambiguous", self-check present but
+    #                             top confidence >= 0.5 (model had enough to lean, hedged anyway)
+    #   "inconsistent_label"    — conclusion disagrees with top hypothesis without a
+    #                             self-check abstention rationale (likely an error)
+    hypotheses = step.get("hypotheses", [])
+    mismatch_type = None
+    if hypotheses:
+        top = max(hypotheses, key=lambda h: h.get("confidence", 0))
+        top_label = top["label"]
+        top_confidence = top.get("confidence", 0)
+        stated = step.get("conclusion")
+        if stated != top_label:
+            self_check = step.get("self_check_argument") or ""
+            if stated == "ambiguous" and self_check.strip():
+                mismatch_type = "unjustified_hedge" if top_confidence >= 0.5 else "deliberate_abstention"
+            else:
+                mismatch_type = "inconsistent_label"
+    step["mismatch_type"] = mismatch_type
+    belief_state.mismatch_type = mismatch_type
+
+    # Write raw response + parsed step to a local log file for post-hoc inspection.
+    os.makedirs("logs", exist_ok=True)
+    run_id_tag = belief_state.run_id if belief_state.run_id is not None else "unknown"
+    log_path = f"logs/conclude_{run_id_tag}_{turn}.json"
+    with open(log_path, "w") as _f:
+        json.dump({
+            "run_id": belief_state.run_id,
+            "turn": turn,
+            "raw_response": raw,
+            "parsed_step": step,
+            "mismatch_type": mismatch_type,
+        }, _f, indent=2)
 
 
 FORCE_UPDATE_PROMPT = """\
@@ -493,6 +538,91 @@ def _force_belief_update(
         belief_state.belief_trajectory.append(_snapshot(belief_state))
 
 
+FORCE_CONCLUDE_PROMPT = """\
+Your tool-call budget (or turn limit) is exhausted. This is your FINAL turn.
+You may not call a tool and you may not just update your belief state — you
+MUST conclude now.
+
+ALLOWED HYPOTHESES (choose only from this list):
+- flaky_test
+- real_regression
+- env_dependency
+- ci_infra_issue
+- schema_change
+- healthy
+- ambiguous
+- other
+
+CURRENT BELIEF STATE:
+{belief_state_json}
+
+EVIDENCE LOG SO FAR:
+{evidence_log_json}
+
+Choose the single best-supported hypothesis given the evidence gathered so
+far. If the evidence is genuinely insufficient to discriminate between
+competing hypotheses even in principle, conclude "ambiguous" — but do not
+default to "ambiguous" merely because you are out of tool calls; if one
+hypothesis is well supported, conclude it.
+
+Before finalizing, briefly argue against your own leading hypothesis using
+the evidence log in self_check_argument — if you can construct a plausible
+counter-argument you cannot rule out, say so, but you must still commit to
+a conclusion this turn.
+
+Respond ONLY in this exact JSON format, nothing else:
+{{
+  "action": "conclude",
+  "hypotheses": [{{"label": "...", "confidence": 0.0, "rationale": "..."}}, ...],
+  "conclusion": "..." (one of the allowed hypotheses or "ambiguous"),
+  "self_check_argument": "..."
+}}\
+"""
+
+
+def _force_conclude(
+    belief_state: BeliefState,
+    backend: str,
+    model: str,
+    timeout: int,
+    turn: int,
+) -> bool:
+    """Give the model one final conclude-only turn instead of immediately
+    forcing 'ambiguous'. Tool calls and belief-only updates are not permitted
+    on this turn — the response is only accepted if it is a valid 'conclude'
+    action with a recognized hypothesis label.
+
+    Returns True if a valid conclusion was applied (conclusion_source stays
+    'model_concluded', status becomes 'concluded'). Returns False, leaving
+    belief_state untouched, if the model fails to produce a valid conclude
+    action — the caller must then force 'ambiguous' with
+    conclusion_source='forced_budget_exhaustion'.
+
+    Does not count against the tool budget.
+    """
+    prompt = FORCE_CONCLUDE_PROMPT.format(
+        belief_state_json=json.dumps(belief_state.current_belief, indent=2),
+        evidence_log_json=json.dumps(belief_state.evidence_log, indent=2),
+    )
+    raw = call_llm(prompt, backend, model, timeout=timeout).strip()
+    if raw.startswith("```"):
+        raw = "\n".join(
+            line for line in raw.splitlines()
+            if not line.strip().startswith("```")
+        ).strip()
+
+    try:
+        step, _ = json.JSONDecoder().raw_decode(raw)
+    except (json.JSONDecodeError, ValueError):
+        return False
+
+    if step.get("action") != "conclude" or step.get("conclusion") not in ALLOWED_HYPOTHESES:
+        return False
+
+    _apply_conclusion(belief_state, step, turn, raw)
+    return True
+
+
 def run_loop(
     belief_state: BeliefState,
     tool_schemas: list[dict],
@@ -507,11 +637,14 @@ def run_loop(
         if belief_state.status != "running":
             break
         if belief_state.tool_calls_used >= belief_state.tool_call_budget:
-            belief_state.pre_override_belief = copy.deepcopy(belief_state.current_belief)
-            belief_state.status = "budget_exhausted"
-            belief_state.conclusion = "ambiguous"
-            belief_state.conclusion_source = "forced_budget_exhaustion"
-            print("[loop] budget exhausted — concluding ambiguous")
+            if _force_conclude(belief_state, backend, model, timeout, turn):
+                print("[loop] budget exhausted — model concluded on final turn")
+            else:
+                belief_state.pre_override_belief = copy.deepcopy(belief_state.current_belief)
+                belief_state.status = "budget_exhausted"
+                belief_state.conclusion = "ambiguous"
+                belief_state.conclusion_source = "forced_budget_exhaustion"
+                print("[loop] budget exhausted — model failed to conclude on final turn — forcing ambiguous")
             break
 
         step = think_step(belief_state, tool_schemas, tool_registry, backend, model, timeout, turn=turn)
@@ -528,11 +661,14 @@ def run_loop(
         print(f"[turn {turn}] {label}")
 
     if belief_state.status == "running":
-        belief_state.pre_override_belief = copy.deepcopy(belief_state.current_belief)
-        belief_state.status = "budget_exhausted"
-        belief_state.conclusion = "ambiguous"
-        belief_state.conclusion_source = "forced_budget_exhaustion"
-        print("[loop] turn limit exhausted — concluding ambiguous")
+        if _force_conclude(belief_state, backend, model, timeout, max_turns):
+            print("[loop] turn limit exhausted — model concluded on final turn")
+        else:
+            belief_state.pre_override_belief = copy.deepcopy(belief_state.current_belief)
+            belief_state.status = "budget_exhausted"
+            belief_state.conclusion = "ambiguous"
+            belief_state.conclusion_source = "forced_budget_exhaustion"
+            print("[loop] turn limit exhausted — model failed to conclude on final turn — forcing ambiguous")
 
     return belief_state
 
@@ -746,6 +882,139 @@ def _make_query_flakiness_history(
     return query_flakiness_history
 
 
+def _make_query_ci_infra_status() -> Callable:
+    """Return a callable for the query_ci_infra_status tool.
+
+    Queries the public githubstatus.com API — no GitHub token required.
+
+    Coverage limitation: the API returns at most 50 incidents with no real
+    pagination (page=2 returns identical data to page=1). The window currently
+    spans roughly 10 weeks. Timestamps older than the oldest available incident
+    are flagged via timestamp_within_coverage: false so the caller knows the
+    absence of results is not informative.
+    """
+
+    def _parse_dt(s: str) -> datetime:
+        return datetime.fromisoformat(s.replace("Z", "+00:00")).replace(
+            tzinfo=timezone.utc
+        ) if datetime.fromisoformat(s.replace("Z", "+00:00")).tzinfo is None else \
+            datetime.fromisoformat(s.replace("Z", "+00:00"))
+
+    def query_ci_infra_status(timestamp: str) -> dict:
+        try:
+            query_dt = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+            if query_dt.tzinfo is None:
+                query_dt = query_dt.replace(tzinfo=timezone.utc)
+        except ValueError:
+            return {"error": f"could not parse timestamp {timestamp!r} — expected ISO 8601"}
+
+        try:
+            resp = requests.get(GITHUB_STATUS_INCIDENTS_URL, timeout=15)
+            resp.raise_for_status()
+            incidents = resp.json().get("incidents", [])
+        except Exception as exc:
+            return {"error": f"GitHub Status API request failed: {exc}"}
+
+        if not incidents:
+            return {
+                "incidents_active_at_timestamp": [],
+                "incident_count": 0,
+                "timestamp_within_coverage": False,
+                "coverage_note": "API returned no incidents; coverage window unknown.",
+            }
+
+        # Incidents are newest-first; the last entry is the oldest available.
+        coverage_start_str = incidents[-1]["created_at"]
+        coverage_start_dt = datetime.fromisoformat(
+            coverage_start_str.replace("Z", "+00:00")
+        )
+        if coverage_start_dt.tzinfo is None:
+            coverage_start_dt = coverage_start_dt.replace(tzinfo=timezone.utc)
+
+        if query_dt < coverage_start_dt:
+            return {
+                "incidents_active_at_timestamp": [],
+                "incident_count": 0,
+                "timestamp_within_coverage": False,
+                "coverage_start": coverage_start_str,
+                "coverage_note": (
+                    f"The GitHub Status API returns at most 50 incidents. "
+                    f"The oldest available is from {coverage_start_str}. "
+                    f"The queried timestamp ({timestamp}) predates this window — "
+                    f"'no incidents' cannot be treated as evidence of no outage."
+                ),
+            }
+
+        active = []
+        for inc in incidents:
+            inc_start = datetime.fromisoformat(inc["created_at"].replace("Z", "+00:00"))
+            if inc_start.tzinfo is None:
+                inc_start = inc_start.replace(tzinfo=timezone.utc)
+
+            resolved_str = inc.get("resolved_at")
+            if resolved_str:
+                inc_end = datetime.fromisoformat(resolved_str.replace("Z", "+00:00"))
+                if inc_end.tzinfo is None:
+                    inc_end = inc_end.replace(tzinfo=timezone.utc)
+            else:
+                inc_end = None  # still ongoing at time of API call
+
+            if inc_start > query_dt:
+                continue  # incident hadn't started yet
+            if inc_end is not None and inc_end < query_dt:
+                continue  # incident was already resolved
+
+            # Check whether this incident affected GitHub Actions.
+            affects_actions = any(
+                comp.get("code") == GITHUB_ACTIONS_COMPONENT_ID
+                for upd in inc.get("incident_updates", [])
+                for comp in (upd.get("affected_components") or [])
+            )
+            if not affects_actions:
+                continue
+
+            active.append({
+                "name": inc["name"],
+                "impact": inc.get("impact"),
+                "status": inc.get("status"),
+                "started_at": inc["created_at"],
+                "resolved_at": inc.get("resolved_at"),
+                "shortlink": inc.get("shortlink"),
+            })
+
+        return {
+            "incidents_active_at_timestamp": active,
+            "incident_count": len(active),
+            "timestamp_within_coverage": True,
+            "coverage_start": coverage_start_str,
+        }
+
+    return query_ci_infra_status
+
+
+def build_tool_registry(
+    owner: str, repo: str, token: str, run_id: int
+) -> tuple[dict[str, Callable], list[dict]]:
+    """Build the tool registry + schema list for the current, live tool set.
+
+    Single source of truth for which tools are wired into the agent — both this
+    module's __main__ and run_full_sweep.py call this, so the two cannot drift
+    out of sync the way they did when query_ci_infra_status was deregistered here
+    but left active in run_full_sweep.py's separate copy.
+    """
+    tool_registry = {
+        "query_test_failure_logs": _make_query_test_failure_logs(owner, repo, token),
+        "query_ci_run_history": _make_query_ci_run_history(owner, repo, token, run_id),
+        "query_flakiness_history": _make_query_flakiness_history(owner, repo, token, run_id),
+    }
+    tool_schemas = [
+        QUERY_TEST_FAILURE_LOGS_SCHEMA,
+        QUERY_CI_RUN_HISTORY_SCHEMA,
+        QUERY_FLAKINESS_HISTORY_SCHEMA,
+    ]
+    return tool_registry, tool_schemas
+
+
 if __name__ == "__main__":
     import argparse
     import time
@@ -838,25 +1107,11 @@ if __name__ == "__main__":
         run_id=run_id,
     )
 
-    tool_registry = {
-        "query_test_failure_logs": _make_query_test_failure_logs(
-            args.owner, args.repo, token
-        ),
-        "query_ci_run_history": _make_query_ci_run_history(
-            args.owner, args.repo, token, run_id
-        ),
-        "query_flakiness_history": _make_query_flakiness_history(
-            args.owner, args.repo, token, run_id
-        ),
-    }
+    tool_registry, tool_schemas = build_tool_registry(args.owner, args.repo, token, run_id)
 
     final = run_loop(
         belief_state,
-        tool_schemas=[
-            QUERY_TEST_FAILURE_LOGS_SCHEMA,
-            QUERY_CI_RUN_HISTORY_SCHEMA,
-            QUERY_FLAKINESS_HISTORY_SCHEMA,
-        ],
+        tool_schemas=tool_schemas,
         tool_registry=tool_registry,
         backend=args.backend,
         model=model,
