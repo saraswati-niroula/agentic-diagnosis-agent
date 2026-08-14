@@ -45,12 +45,42 @@ from agent.loop import (  # noqa: E402
     _uniform_prior,
     run_loop,
 )
+from agent.baselines import (  # noqa: E402
+    run_fixed_order_baseline,
+    run_single_shot_baseline,
+)
 
 from tools.trigger_and_fetch import (  # noqa: E402
     get_latest_run,
     poll_until_complete,
     trigger_run,
 )
+
+# Fixed (tool_name, param_fn) sequence shared by both RQ1 baselines — the
+# harness executes these directly, bypassing the model's own tool choice.
+# param_fn receives (evidence_log_so_far, run_id).
+#
+# test_id is derived mechanically from tool #1's (query_test_failure_logs)
+# failures_detail — NOT hardcoded — so "fixed order" means a fixed SELECTION
+# of which tool runs when, not a fixed parameter value.
+#
+# Known-limitation interaction (docs/research_notes.md): query_flakiness_history
+# undercounts failures among historical runs whose OWN evidence lacks
+# failures_detail (e.g. other no_test_output-type runs like ci_infra_issue) —
+# those runs have had_failures=True but an empty failures_detail list, which
+# falls through to "passed" in query_flakiness_history's outcome logic
+# regardless of what test_id is queried. This affects both baselines below
+# identically to how it would affect the full loop whenever the CURRENT run
+# is itself a no_test_output type (test_id will be "" here, and/or the
+# historical sample will undercount independent of that value).
+CI_FIXED_ORDER = [
+    ("query_test_failure_logs", lambda ev, run_id: {"run_id": run_id}),
+    ("query_ci_run_history", lambda ev, run_id: {"limit": 10}),
+    ("query_flakiness_history", lambda ev, run_id: {
+        "test_id": (ev[-2]["result"].get("failures_detail") or [{}])[0].get("test_id", ""),
+        "run_ids": [r["run_id"] for r in ev[-1]["result"].get("runs", [])],
+    }),
+]
 
 # Ground truth per scenario, i.e. the injected failure type when the run
 # actually fires (github_conclusion == "failure"). When a scenario doesn't
@@ -73,7 +103,7 @@ SCENARIOS = [
 STOCHASTIC_SCENARIO_TYPES = {"flaky_test", "ambiguous_flaky_or_regression"}
 
 
-def run_one_scenario(owner, repo, failure_type, backend, model, token, tool_budget, llm_timeout):
+def run_one_scenario(owner, repo, failure_type, backend, model, token, tool_budget, llm_timeout, mode="full"):
     print(f"\n{'=' * 60}\nSCENARIO: {failure_type}\n{'=' * 60}")
 
     trigger_run(owner, repo, failure_type, token)
@@ -98,27 +128,68 @@ def run_one_scenario(owner, repo, failure_type, backend, model, token, tool_budg
         tool_call_budget=tool_budget,
         status="running",
         run_id=run_id,
+        mode=mode,
     )
 
     tool_registry, tool_schemas = build_tool_registry(owner, repo, token, run_id)
 
-    final = run_loop(
-        belief_state,
-        tool_schemas=tool_schemas,
-        tool_registry=tool_registry,
-        backend=backend,
-        model=model,
-        timeout=llm_timeout,
-    )
+    if mode in ("full", "no_backtrack"):
+        final = run_loop(
+            belief_state,
+            tool_schemas=tool_schemas,
+            tool_registry=tool_registry,
+            backend=backend,
+            model=model,
+            timeout=llm_timeout,
+        )
+    elif mode == "single_shot":
+        # No real "budget" concept for this baseline — it always runs
+        # exactly len(CI_FIXED_ORDER) up-front calls, so report that instead
+        # of the --tool-budget CLI value, which doesn't apply here.
+        belief_state.tool_call_budget = len(CI_FIXED_ORDER)
+        final = run_single_shot_baseline(
+            belief_state, tool_registry, CI_FIXED_ORDER, backend, model, llm_timeout,
+        )
+    elif mode == "fixed_order":
+        belief_state.tool_call_budget = len(CI_FIXED_ORDER)
+        final = run_fixed_order_baseline(
+            belief_state, tool_registry, CI_FIXED_ORDER, backend, model, llm_timeout,
+        )
+    else:
+        raise ValueError(f"unknown mode {mode!r}")
+
+    # "confidence" is the number RQ3's calibration comparison scores against
+    # ground truth, so it must track whichever hypothesis this run is actually
+    # committed to. In "full" mode that's max(current_belief). In
+    # "no_backtrack" mode the locked label is not guaranteed to be the
+    # numerical max once a lock violation occurs (see _commit_belief) — the
+    # locked label's own confidence is the correct number to report there.
+    if final.mode == "no_backtrack" and final.locked_hypothesis is not None:
+        locked_entry = next(
+            (h for h in final.current_belief if h.get("label") == final.locked_hypothesis),
+            None,
+        )
+        confidence = locked_entry.get("confidence") if locked_entry else None
+    else:
+        confidence = max((h["confidence"] for h in final.current_belief), default=None)
 
     return {
         "failure_type": failure_type,
         "run_id": run_id,
         "github_conclusion": completed["conclusion"],
+        "mode": final.mode,
         "conclusion": final.conclusion,
         "conclusion_source": final.conclusion_source,
-        "confidence": max((h["confidence"] for h in final.current_belief), default=None),
+        "model_stated_conclusion": final.model_stated_conclusion,
+        "confidence": confidence,
         "mismatch_type": final.mismatch_type,
+        "locked_hypothesis": final.locked_hypothesis,
+        "lock_confidence": final.lock_confidence,
+        "lock_margin": final.lock_margin,
+        "lock_violations_count": sum(
+            1 for e in final.lock_enforcement_log if e["event"] != "locked"
+        ),
+        "lock_enforcement_log": final.lock_enforcement_log,
         "tool_calls_used": final.tool_calls_used,
         "tool_call_budget": final.tool_call_budget,
         "belief_trajectory_len": len(final.belief_trajectory),
@@ -141,6 +212,18 @@ def main():
     parser.add_argument(
         "--only", default=None,
         help="Comma-separated list of failure_type values to run, instead of all 8",
+    )
+    parser.add_argument(
+        "--mode", default="full",
+        choices=["full", "no_backtrack", "single_shot", "fixed_order"],
+        help=(
+            "full (default): current behaviour. no_backtrack: RQ1 ablation 3 — "
+            "locks the leading hypothesis label after the first belief update; "
+            "see _commit_belief in agent/loop.py. single_shot: RQ1 baseline 1 — "
+            "all evidence handed over up front, one LLM call, no iteration. "
+            "fixed_order: RQ1 baseline 2 — tools called in a hardcoded sequence, "
+            "no dynamic hypothesis-driven tool choice; see agent/baselines.py."
+        ),
     )
     args = parser.parse_args()
 
@@ -167,7 +250,7 @@ def main():
     for i, (failure_type, ground_truth) in enumerate(scenarios):
         result = run_one_scenario(
             args.owner, args.repo, failure_type, args.backend, model,
-            token, args.tool_budget, args.llm_timeout,
+            token, args.tool_budget, args.llm_timeout, mode=args.mode,
         )
         # Ground truth branches on whether the run actually fired, not on
         # scenario name: a scenario that didn't trigger the injected failure

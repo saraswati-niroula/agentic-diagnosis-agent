@@ -51,6 +51,17 @@ ALLOWED_HYPOTHESES = [
     "other",
 ]
 
+# Default healthy-hint sentence for the CI domain (see research_notes.md #1 —
+# without this, the model can silently misattribute a non-failing run to
+# "other" instead of "healthy"). Carried on BeliefState.healthy_hint rather
+# than hardcoded in the prompt templates, so a second domain can supply its
+# own version referencing its own evidence field instead of `had_failures`.
+DEFAULT_HEALTHY_HINT = (
+    'IMPORTANT: if the evidence shows had_failures: false (no test failures detected), '
+    'you MUST conclude "healthy" — do NOT conclude "other". "other" is reserved for '
+    'failure runs where the root cause does not fit any named hypothesis.'
+)
+
 DEFAULT_MODELS = {
     "cerebras": "gpt-oss-120b",
     "ollama": "llama3.2",
@@ -65,18 +76,9 @@ set of possible hypotheses, a log of evidence gathered so far, and a limited
 number of tool calls remaining.
 
 ALLOWED HYPOTHESES (choose only from this list):
-- flaky_test
-- real_regression
-- env_dependency
-- ci_infra_issue
-- schema_change
-- healthy
-- ambiguous
-- other
+{allowed_hypotheses_bullets}
 
-IMPORTANT: if the evidence shows had_failures: false (no test failures detected),
-you MUST conclude "healthy" — do NOT conclude "other". "other" is reserved for
-failure runs where the root cause does not fit any named hypothesis.
+{healthy_hint}
 
 CURRENT BELIEF STATE:
 {belief_state_json}
@@ -251,16 +253,61 @@ class BeliefState:
     belief_trajectory: list[list[dict]] = field(default_factory=list)
     conclusion: str | None = None
     conclusion_source: str | None = None      # "model_concluded" | "forced_budget_exhaustion"
+    # Only set in "no_backtrack" mode, and only when the model's stated
+    # conclusion is overridden to the locked hypothesis (see
+    # _apply_conclusion). Preserves what the model actually concluded before
+    # the ablation's forced override, so that data isn't lost when
+    # `conclusion` is rewritten. None in "full" mode and None whenever no
+    # override occurred (i.e. the model's conclusion already matched the
+    # lock, or was "ambiguous").
+    model_stated_conclusion: str | None = None
     pre_override_belief: list[dict] | None = None  # diagnostic only — never use in metrics
     self_check_argument: str | None = None
     run_id: int | None = None
+    # "full" (default, current behaviour) | "no_backtrack" (RQ1 ablation — see
+    # _commit_belief). Recorded on the belief state itself so callers never
+    # need to thread mode through every function signature.
+    mode: str = "full"
+    # Per-run domain config, threaded through the prompt templates instead of
+    # read from the module-global ALLOWED_HYPOTHESES/DEFAULT_HEALTHY_HINT —
+    # this is what makes the loop's control flow (this file) domain-agnostic:
+    # a second domain supplies its own hypothesis set and healthy-hint
+    # sentence through these two fields, with run_loop/think_step/
+    # _commit_belief/_force_conclude unchanged. Defaults match the CI domain
+    # exactly, so existing callers that don't set these get identical
+    # behavior to before this field existed.
+    allowed_hypotheses: list[str] = field(default_factory=lambda: list(ALLOWED_HYPOTHESES))
+    healthy_hint: str = DEFAULT_HEALTHY_HINT
+    # Set on the first genuine belief update in "no_backtrack" mode and never
+    # changed again — see _commit_belief. Always None in "full" mode.
+    locked_hypothesis: str | None = None
+    # Set once, at the same moment as locked_hypothesis: the locked label's
+    # own confidence at lock time, and its margin over the highest-confidence
+    # other hypothesis in that same first committed belief list. Both None in
+    # "full" mode. A low margin means the lock committed to a near-tied early
+    # lean rather than a clear signal — see docs/research_notes.md #21.
+    lock_confidence: float | None = None
+    lock_margin: float | None = None
+    # Diagnostic-only record of every lock event/violation in "no_backtrack"
+    # mode: {"turn", "event": "locked"|"violation_demoted"|"violation_reinserted", ...}.
+    # Never used in metrics directly, but is the signal for how often the
+    # model attempted to backtrack under the ablation.
+    lock_enforcement_log: list[dict] = field(default_factory=list)
     # "inconsistent_label"    — conclusion disagrees with top hypothesis, no self-check abstention rationale
     # "deliberate_abstention" — conclusion is "ambiguous", self-check argues genuine evidence overlap,
     #                           top hypothesis confidence < 0.5 (evidence genuinely near-tied)
     # "unjustified_hedge"     — conclusion is "ambiguous", self-check present but top confidence >= 0.5,
     #                           indicating the model hedged against a signal sufficient to lean on
+    # "lock_override"         — "no_backtrack" mode ONLY: conclusion is a specific (non-ambiguous)
+    #                           hypothesis that differs from the locked label. This is the ablation
+    #                           constraint doing its job, not reasoning incoherence — must never be
+    #                           conflated with "inconsistent_label".
     # None                    — conclusion matches top hypothesis (no mismatch)
     mismatch_type: str | None = None
+
+
+def _hypotheses_bullets(hypotheses: list[str]) -> str:
+    return "\n".join(f"- {h}" for h in hypotheses)
 
 
 def _uniform_prior() -> list[dict]:
@@ -347,6 +394,94 @@ def call_llm(prompt: str, backend: str, model: str, timeout: int = 300) -> str:
     raise ValueError(f"Unknown backend {backend!r}. Choose: cerebras, ollama, groq, gemini.")
 
 
+def _commit_belief(
+    belief_state: BeliefState,
+    hypotheses: list[dict],
+    turn: int | None = None,
+) -> None:
+    """Single choke point for writing a new hypotheses list into belief_state.
+
+    In "full" mode this is a pure passthrough — belief_state.current_belief
+    is simply reassigned, identical to the old inline assignments this
+    replaces.
+
+    In "no_backtrack" mode this enforces that the LEADING HYPOTHESIS LABEL
+    never changes after the first genuine belief update, but the enforcement
+    is purely mechanical and happens only here, after the model has already
+    responded. The prompts are byte-for-byte identical across modes — nothing
+    tells the model about the lock, so it reasons and may attempt to change
+    its leading hypothesis exactly as it would in "full" mode. This function
+    only constrains what gets recorded afterward. That means this ablation
+    measures "an agent whose backtracking is overridden by the harness," not
+    "an agent that never considers backtracking" — lock_enforcement_log is
+    the diagnostic for how often the model tried and was overridden. A
+    prompt-level variant (telling the model about the lock up front) would be
+    a distinct ablation arm and is not implemented here.
+
+    Confidence values are never fabricated or reassigned between labels —
+    only the LABEL is locked. The locked hypothesis's confidence is always
+    whatever the model actually assigned it (0.0 if the model omitted it),
+    even when that leaves it below other hypotheses' confidence. Because of
+    this, belief_state.locked_hypothesis is NOT guaranteed to be
+    max(current_belief, key=confidence) once a violation has occurred —
+    callers that need "the hypothesis this run is committed to" must read
+    belief_state.locked_hypothesis directly rather than recomputing a max.
+    """
+    if belief_state.mode != "no_backtrack" or not hypotheses:
+        belief_state.current_belief = hypotheses
+        return
+
+    if belief_state.locked_hypothesis is None:
+        top = max(hypotheses, key=lambda h: h.get("confidence", 0))
+        other_confidences = [
+            h.get("confidence", 0) for h in hypotheses if h.get("label") != top["label"]
+        ]
+        belief_state.locked_hypothesis = top["label"]
+        belief_state.lock_confidence = top.get("confidence", 0)
+        belief_state.lock_margin = belief_state.lock_confidence - max(other_confidences, default=0)
+        belief_state.current_belief = hypotheses
+        belief_state.lock_enforcement_log.append({
+            "turn": turn,
+            "event": "locked",
+            "label": top["label"],
+        })
+        return
+
+    locked = belief_state.locked_hypothesis
+    locked_entry = next((h for h in hypotheses if h.get("label") == locked), None)
+
+    if locked_entry is None:
+        # Model dropped the locked label entirely. Reinsert it at confidence
+        # 0.0 — do NOT renormalize or borrow another hypothesis's value. Copy
+        # the list (not the individual dicts) so this never mutates the
+        # caller's original step["hypotheses"], which conclude logging relies
+        # on to preserve the model's raw, unenforced output.
+        hypotheses = list(hypotheses) + [{
+            "label": locked,
+            "confidence": 0.0,
+            "rationale": "reasserted by no_backtrack lock — model omitted this hypothesis",
+        }]
+        belief_state.lock_enforcement_log.append({
+            "turn": turn,
+            "event": "violation_reinserted",
+            "sum_at_omission": round(sum(h.get("confidence", 0) for h in hypotheses), 4),
+        })
+    else:
+        top = max(hypotheses, key=lambda h: h.get("confidence", 0))
+        if top["label"] != locked:
+            belief_state.lock_enforcement_log.append({
+                "turn": turn,
+                "event": "violation_demoted",
+                "attempted_top_label": top["label"],
+                "attempted_top_confidence": top.get("confidence", 0),
+                "locked_label_confidence": locked_entry.get("confidence", 0),
+            })
+        # else: locked label happens to still be numerically on top — no
+        # violation, nothing to log or change.
+
+    belief_state.current_belief = hypotheses
+
+
 def think_step(
     belief_state: BeliefState,
     tool_schemas: list[dict],
@@ -358,6 +493,8 @@ def think_step(
 ) -> dict:
     """Run one LLM turn and dispatch the resulting action. Mutates belief_state."""
     prompt = PROMPT_TEMPLATE.format(
+        allowed_hypotheses_bullets=_hypotheses_bullets(belief_state.allowed_hypotheses),
+        healthy_hint=belief_state.healthy_hint,
         belief_state_json=json.dumps(belief_state.current_belief, indent=2),
         evidence_log_json=json.dumps(belief_state.evidence_log, indent=2),
         tool_calls_used=belief_state.tool_calls_used,
@@ -422,7 +559,9 @@ def think_step(
         belief_state.belief_trajectory.append(_snapshot(belief_state))
 
     elif action == "update_belief":
-        belief_state.current_belief = step.get("hypotheses", belief_state.current_belief)
+        hypotheses = step.get("hypotheses")
+        if hypotheses is not None:
+            _commit_belief(belief_state, hypotheses, turn)
         belief_state.belief_trajectory.append(_snapshot(belief_state))
 
     elif action == "conclude":
@@ -439,32 +578,67 @@ def _apply_conclusion(belief_state: BeliefState, step: dict, turn: int, raw: str
     conclude-only turn granted on budget/turn-limit exhaustion (_force_conclude),
     so both paths log and classify identically.
     """
-    belief_state.current_belief = step.get("hypotheses", belief_state.current_belief)
+    hypotheses = step.get("hypotheses")
+    if hypotheses is not None:
+        _commit_belief(belief_state, hypotheses, turn)
     belief_state.belief_trajectory.append(_snapshot(belief_state))
     belief_state.status = "concluded"
     belief_state.conclusion = step.get("conclusion", "ambiguous")
     belief_state.conclusion_source = "model_concluded"
     belief_state.self_check_argument = step.get("self_check_argument", "")
 
-    # Classify conclusion/belief relationship into one of four cases:
+    # no_backtrack ablation: force the reported conclusion to the locked
+    # hypothesis whenever the model stated something else specific. Without
+    # this, a model that reasons its way back to the correct label produces
+    # the same conclusion as "full" mode, and the RQ1 comparison has nothing
+    # to measure. "ambiguous" passes through unchanged — the ablation
+    # constrains which hypothesis the run commits to, not whether it may
+    # abstain.
+    if (
+        belief_state.mode == "no_backtrack"
+        and belief_state.locked_hypothesis is not None
+        and belief_state.conclusion not in (belief_state.locked_hypothesis, "ambiguous")
+    ):
+        belief_state.model_stated_conclusion = belief_state.conclusion
+        belief_state.conclusion = belief_state.locked_hypothesis
+
+    # Classify conclusion/belief relationship into one of five cases:
     #   None                    — conclusion matches top hypothesis (no mismatch)
     #   "deliberate_abstention" — conclusion is "ambiguous", self-check argues genuine
     #                             evidence overlap, top confidence < 0.5 (near-tied)
     #   "unjustified_hedge"     — conclusion is "ambiguous", self-check present but
     #                             top confidence >= 0.5 (model had enough to lean, hedged anyway)
+    #   "lock_override"         — no_backtrack mode ONLY: conclusion is a specific
+    #                             (non-ambiguous) hypothesis differing from the locked label
     #   "inconsistent_label"    — conclusion disagrees with top hypothesis without a
     #                             self-check abstention rationale (likely an error)
-    hypotheses = step.get("hypotheses", [])
+    #
+    # "top hypothesis" means max(current_belief, key=confidence) in "full" mode, but
+    # in "no_backtrack" mode it means belief_state.locked_hypothesis specifically —
+    # see _commit_belief docstring for why those two are not interchangeable once a
+    # lock violation has occurred.
+    committed_hypotheses = belief_state.current_belief
     mismatch_type = None
-    if hypotheses:
-        top = max(hypotheses, key=lambda h: h.get("confidence", 0))
-        top_label = top["label"]
-        top_confidence = top.get("confidence", 0)
+    if committed_hypotheses:
         stated = step.get("conclusion")
+        self_check = step.get("self_check_argument") or ""
+
+        if belief_state.mode == "no_backtrack" and belief_state.locked_hypothesis is not None:
+            top_label = belief_state.locked_hypothesis
+            top_entry = next(
+                (h for h in committed_hypotheses if h.get("label") == top_label), None
+            )
+            top_confidence = top_entry.get("confidence", 0) if top_entry else 0
+        else:
+            top = max(committed_hypotheses, key=lambda h: h.get("confidence", 0))
+            top_label = top["label"]
+            top_confidence = top.get("confidence", 0)
+
         if stated != top_label:
-            self_check = step.get("self_check_argument") or ""
             if stated == "ambiguous" and self_check.strip():
                 mismatch_type = "unjustified_hedge" if top_confidence >= 0.5 else "deliberate_abstention"
+            elif belief_state.mode == "no_backtrack" and stated != "ambiguous":
+                mismatch_type = "lock_override"
             else:
                 mismatch_type = "inconsistent_label"
     step["mismatch_type"] = mismatch_type
@@ -512,6 +686,7 @@ def _force_belief_update(
     backend: str,
     model: str,
     timeout: int = 300,
+    turn: int | None = None,
 ) -> None:
     """Force a belief-update turn immediately after a tool call.
 
@@ -521,7 +696,7 @@ def _force_belief_update(
     prompt = FORCE_UPDATE_PROMPT.format(
         last_evidence_json=json.dumps(belief_state.evidence_log[-1], indent=2),
         evidence_log_json=json.dumps(belief_state.evidence_log, indent=2),
-        allowed=", ".join(ALLOWED_HYPOTHESES),
+        allowed=", ".join(belief_state.allowed_hypotheses),
     )
     raw = call_llm(prompt, backend, model, timeout=timeout).strip()
     if raw.startswith("```"):
@@ -534,7 +709,7 @@ def _force_belief_update(
     except json.JSONDecodeError:
         return  # leave belief unchanged rather than crash
     if step.get("action") == "update_belief" and "hypotheses" in step:
-        belief_state.current_belief = step["hypotheses"]
+        _commit_belief(belief_state, step["hypotheses"], turn)
         belief_state.belief_trajectory.append(_snapshot(belief_state))
 
 
@@ -544,14 +719,7 @@ You may not call a tool and you may not just update your belief state — you
 MUST conclude now.
 
 ALLOWED HYPOTHESES (choose only from this list):
-- flaky_test
-- real_regression
-- env_dependency
-- ci_infra_issue
-- schema_change
-- healthy
-- ambiguous
-- other
+{allowed_hypotheses_bullets}
 
 CURRENT BELIEF STATE:
 {belief_state_json}
@@ -601,6 +769,7 @@ def _force_conclude(
     Does not count against the tool budget.
     """
     prompt = FORCE_CONCLUDE_PROMPT.format(
+        allowed_hypotheses_bullets=_hypotheses_bullets(belief_state.allowed_hypotheses),
         belief_state_json=json.dumps(belief_state.current_belief, indent=2),
         evidence_log_json=json.dumps(belief_state.evidence_log, indent=2),
     )
@@ -616,7 +785,7 @@ def _force_conclude(
     except (json.JSONDecodeError, ValueError):
         return False
 
-    if step.get("action") != "conclude" or step.get("conclusion") not in ALLOWED_HYPOTHESES:
+    if step.get("action") != "conclude" or step.get("conclusion") not in belief_state.allowed_hypotheses:
         return False
 
     _apply_conclusion(belief_state, step, turn, raw)
@@ -652,7 +821,7 @@ def run_loop(
         label = f"action={step['action']}"
         if step["action"] == "call_tool":
             label += f" tool={step.get('tool_name')} discriminates={step.get('discriminates_between')}"
-            _force_belief_update(belief_state, backend, model, timeout)
+            _force_belief_update(belief_state, backend, model, timeout, turn=turn)
         elif step["action"] == "conclude":
             label += f" conclusion={step.get('conclusion')}"
             mt = step.get("mismatch_type")
@@ -1050,6 +1219,15 @@ if __name__ == "__main__":
         "--llm-timeout", type=int, default=300,
         help="Seconds to wait for an LLM response (default: 300; increase for slow local models)",
     )
+    parser.add_argument(
+        "--mode", default="full", choices=["full", "no_backtrack"],
+        help=(
+            "full (default): current behaviour, model may revise its leading "
+            "hypothesis freely. no_backtrack: RQ1 ablation — the leading "
+            "hypothesis label is locked after the first belief update; see "
+            "_commit_belief in agent/loop.py."
+        ),
+    )
     args = parser.parse_args()
 
     model = args.model or DEFAULT_MODELS[args.backend]
@@ -1105,6 +1283,7 @@ if __name__ == "__main__":
         tool_call_budget=args.tool_budget,
         status="running",
         run_id=run_id,
+        mode=args.mode,
     )
 
     tool_registry, tool_schemas = build_tool_registry(args.owner, args.repo, token, run_id)
@@ -1120,9 +1299,17 @@ if __name__ == "__main__":
 
     print("\n=== FINAL BELIEF STATE ===")
     print(json.dumps(final.current_belief, indent=2))
-    print(f"\nConclusion:        {final.conclusion}")
+    print(f"\nMode:              {final.mode}")
+    print(f"Conclusion:        {final.conclusion}")
     print(f"Conclusion source: {final.conclusion_source}")
+    print(f"Mismatch type:     {final.mismatch_type}")
     print(f"Self-check:        {final.self_check_argument}")
+    if final.mode == "no_backtrack":
+        print(f"Locked hypothesis: {final.locked_hypothesis}")
+        if final.lock_enforcement_log:
+            print("Lock enforcement log:")
+            for entry in final.lock_enforcement_log:
+                print(f"  {entry}")
     if final.pre_override_belief is not None:
         print("\n=== PRE-OVERRIDE BELIEF (diagnostic only — not for metrics) ===")
         print(json.dumps(final.pre_override_belief, indent=2))
